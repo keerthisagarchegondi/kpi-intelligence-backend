@@ -10,6 +10,9 @@ alembic==1.13.1
 # Data Processing
 pandas==2.2.0
 numpy==1.26.4
+openpyxl==3.1.2  # Excel file support
+pyarrow==15.0.0  # Parquet file support
+xlrd==2.0.1  # Legacy Excel (.xls) support
 
 # Environment Variables
 python-dotenv==1.0.1

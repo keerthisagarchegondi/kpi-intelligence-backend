@@ -98,6 +98,172 @@ COMMENT ON TABLE data_sources IS 'Stores configuration and metadata for all data
 COMMENT ON COLUMN data_sources.id IS 'Unique identifier for the data source';
 COMMENT ON COLUMN data_sources.name IS 'Human-readable name of the data source (must be unique)';
 COMMENT ON COLUMN data_sources.source_type IS 'Type of data source: database, api, file, cloud_storage, etc.';
+
+-- ============================================
+-- Table: datasets
+-- Description: Stores information about ingested datasets and their processing status
+-- ============================================
+DROP TABLE IF EXISTS datasets CASCADE;
+
+CREATE TABLE datasets (
+    -- Primary key
+    id SERIAL PRIMARY KEY,
+    
+    -- Foreign key to data source
+    data_source_id INTEGER REFERENCES data_sources(id) ON DELETE SET NULL,
+    
+    -- Dataset identification
+    name VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255),
+    description TEXT,
+    dataset_type VARCHAR(50) NOT NULL, -- e.g., 'sales', 'financial', 'operational', 'customer'
+    
+    -- File/Data information
+    file_name VARCHAR(255),
+    file_path TEXT,
+    file_format VARCHAR(50), -- e.g., 'csv', 'json', 'xlsx', 'parquet', 'xml'
+    file_size_bytes BIGINT,
+    file_hash VARCHAR(64), -- SHA-256 hash for integrity verification
+    
+    -- Data characteristics
+    row_count BIGINT,
+    column_count INTEGER,
+    schema_info JSONB, -- Column names, types, and metadata
+    data_quality_score DECIMAL(5,2), -- 0-100 quality score
+    
+    -- Processing status
+    status VARCHAR(30) DEFAULT 'pending' CHECK (status IN (
+        'pending',
+        'validating',
+        'processing',
+        'completed',
+        'failed',
+        'archived'
+    )),
+    processing_stage VARCHAR(50), -- e.g., 'ingestion', 'transformation', 'validation'
+    
+    -- Processing metrics
+    ingestion_start_time TIMESTAMP,
+    ingestion_end_time TIMESTAMP,
+    processing_duration_seconds INTEGER,
+    records_processed BIGINT,
+    records_failed BIGINT,
+    records_skipped BIGINT,
+    
+    -- Error tracking
+    error_count INTEGER DEFAULT 0,
+    last_error_message TEXT,
+    error_details JSONB, -- Structured error information
+    validation_errors JSONB, -- Array of validation issues
+    
+    -- Data versioning
+    version INTEGER DEFAULT 1,
+    is_latest_version BOOLEAN DEFAULT true,
+    parent_dataset_id INTEGER REFERENCES datasets(id) ON DELETE SET NULL,
+    
+    -- Data lineage and dependencies
+    source_system VARCHAR(255),
+    source_location TEXT,
+    dependencies JSONB, -- Array of dependent dataset IDs or external references
+    
+    -- Data retention and lifecycle
+    retention_policy VARCHAR(50), -- e.g., '90_days', '1_year', 'permanent'
+    expiration_date DATE,
+    archived_at TIMESTAMP,
+    archive_location TEXT,
+    
+    -- Business metadata
+    owner VARCHAR(255),
+    business_unit VARCHAR(100),
+    tags JSONB, -- Array of tags for categorization
+    custom_metadata JSONB, -- Flexible additional metadata
+    
+    -- Data quality and validation
+    is_validated BOOLEAN DEFAULT false,
+    validated_at TIMESTAMP,
+    validated_by VARCHAR(255),
+    data_profile JSONB, -- Statistical profile of the dataset
+    
+    -- Access and usage tracking
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at TIMESTAMP,
+    last_accessed_by VARCHAR(255),
+    
+    -- Audit fields
+    created_by VARCHAR(255) NOT NULL,
+    updated_by VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    
+    -- Soft delete
+    deleted_at TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT false,
+    
+    -- Constraints
+    CONSTRAINT unique_dataset_name_version UNIQUE (name, version, is_deleted),
+    CONSTRAINT valid_quality_score CHECK (data_quality_score IS NULL OR (data_quality_score >= 0 AND data_quality_score <= 100)),
+    CONSTRAINT valid_duration CHECK (processing_duration_seconds IS NULL OR processing_duration_seconds >= 0),
+    CONSTRAINT valid_counts CHECK (
+        (row_count IS NULL OR row_count >= 0) AND
+        (column_count IS NULL OR column_count >= 0) AND
+        (records_processed IS NULL OR records_processed >= 0) AND
+        (records_failed IS NULL OR records_failed >= 0) AND
+        (records_skipped IS NULL OR records_skipped >= 0)
+    )
+);
+
+-- ============================================
+-- Indexes for datasets table
+-- ============================================
+CREATE INDEX idx_datasets_data_source_id ON datasets(data_source_id);
+CREATE INDEX idx_datasets_name ON datasets(name);
+CREATE INDEX idx_datasets_status ON datasets(status);
+CREATE INDEX idx_datasets_dataset_type ON datasets(dataset_type);
+CREATE INDEX idx_datasets_created_at ON datasets(created_at);
+CREATE INDEX idx_datasets_ingestion_start ON datasets(ingestion_start_time);
+CREATE INDEX idx_datasets_is_latest ON datasets(is_latest_version);
+CREATE INDEX idx_datasets_is_deleted ON datasets(is_deleted);
+CREATE INDEX idx_datasets_owner ON datasets(owner);
+CREATE INDEX idx_datasets_business_unit ON datasets(business_unit);
+CREATE INDEX idx_datasets_file_hash ON datasets(file_hash);
+CREATE INDEX idx_datasets_parent ON datasets(parent_dataset_id);
+
+-- Composite indexes for common query patterns
+CREATE INDEX idx_datasets_status_created ON datasets(status, created_at DESC);
+CREATE INDEX idx_datasets_type_status ON datasets(dataset_type, status);
+CREATE INDEX idx_datasets_latest_active ON datasets(is_latest_version, is_deleted) WHERE is_latest_version = true AND is_deleted = false;
+
+-- GIN indexes for JSONB columns
+CREATE INDEX idx_datasets_schema_info ON datasets USING GIN(schema_info);
+CREATE INDEX idx_datasets_tags ON datasets USING GIN(tags);
+CREATE INDEX idx_datasets_custom_metadata ON datasets USING GIN(custom_metadata);
+CREATE INDEX idx_datasets_error_details ON datasets USING GIN(error_details);
+CREATE INDEX idx_datasets_data_profile ON datasets USING GIN(data_profile);
+
+-- ============================================
+-- Triggers for datasets table
+-- ============================================
+CREATE TRIGGER update_datasets_updated_at
+    BEFORE UPDATE ON datasets
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================
+-- Comments for datasets table
+-- ============================================
+COMMENT ON TABLE datasets IS 'Stores metadata and processing status for all ingested datasets in the KPI Intelligence system';
+COMMENT ON COLUMN datasets.id IS 'Unique identifier for the dataset';
+COMMENT ON COLUMN datasets.data_source_id IS 'Reference to the data source this dataset originated from';
+COMMENT ON COLUMN datasets.name IS 'Unique technical name for the dataset';
+COMMENT ON COLUMN datasets.display_name IS 'Human-readable display name';
+COMMENT ON COLUMN datasets.dataset_type IS 'Classification of dataset type for categorization';
+COMMENT ON COLUMN datasets.file_hash IS 'SHA-256 hash for file integrity verification and duplicate detection';
+COMMENT ON COLUMN datasets.schema_info IS 'JSONB structure containing column definitions and data types';
+COMMENT ON COLUMN datasets.status IS 'Current processing status of the dataset';
+COMMENT ON COLUMN datasets.version IS 'Version number for dataset versioning support';
+COMMENT ON COLUMN datasets.is_latest_version IS 'Flag indicating if this is the most recent version';
+COMMENT ON COLUMN datasets.data_quality_score IS 'Calculated quality score from 0-100 based on validation rules';
+COMMENT ON COLUMN datasets.retention_policy IS 'Data retention policy defining how long to keep the dataset';
 COMMENT ON COLUMN data_sources.connection_config IS 'JSON object containing connection parameters (host, port, database name, etc.)';
 COMMENT ON COLUMN data_sources.auth_credentials IS 'Encrypted authentication credentials stored as JSON';
 COMMENT ON COLUMN data_sources.status IS 'Current operational status of the data source';
