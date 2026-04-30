@@ -14,6 +14,7 @@ import os
 import logging
 import hashlib
 import mimetypes
+import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List, Tuple
 from datetime import datetime
@@ -597,45 +598,536 @@ def get_data_profile(df: pd.DataFrame) -> Dict[str, Any]:
     return profile
 
 
+def read_csv_data(
+    file_path: Union[str, Path],
+    encoding: str = 'utf-8',
+    delimiter: str = ',',
+    header: Union[int, str, None] = 'infer',
+    skiprows: Optional[Union[int, List[int]]] = None,
+    nrows: Optional[int] = None,
+    dtype: Optional[Dict[str, Any]] = None,
+    parse_dates: Optional[Union[bool, List[str]]] = None,
+    **kwargs
+) -> pd.DataFrame:
+    """
+    Read CSV file using pandas with production-level configuration.
+    
+    This function provides a focused CSV reading interface with common options
+    and robust error handling for production environments.
+    
+    Args:
+        file_path: Path to the CSV file
+        encoding: Character encoding (default: 'utf-8', common: 'latin1', 'iso-8859-1')
+        delimiter: Field delimiter (default: ',', also use ';', '|', '\t')
+        header: Row number(s) to use as column names, or 'infer' for automatic detection
+        skiprows: Line numbers to skip (0-indexed) or number of lines to skip at start
+        nrows: Number of rows to read (useful for testing large files)
+        dtype: Dictionary of column names to data types for type enforcement
+        parse_dates: Columns to parse as dates (bool or list of column names)
+        **kwargs: Additional arguments passed to pd.read_csv()
+    
+    Returns:
+        pandas DataFrame with the loaded CSV data
+    
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        DataIngestionError: If reading fails
+    
+    Example:
+        >>> # Basic usage
+        >>> df = read_csv_data('data/raw/sales_2024.csv')
+        >>> 
+        >>> # With specific options
+        >>> df = read_csv_data(
+        ...     'data/raw/sales.csv',
+        ...     delimiter=';',
+        ...     parse_dates=['date_column'],
+        ...     dtype={'customer_id': str}
+        ... )
+        >>> 
+        >>> # Read first 1000 rows for testing
+        >>> df = read_csv_data('data/raw/large_file.csv', nrows=1000)
+    """
+    file_path = Path(file_path)
+    
+    try:
+        # Validate file exists
+        _validate_file_exists(file_path)
+        
+        logger.info(f"Reading CSV file: {file_path}")
+        
+        # Configure header parameter
+        if header == 'infer':
+            header = 0  # Use first row as header
+        
+        # Read CSV with specified options
+        df = pd.read_csv(
+            file_path,
+            encoding=encoding,
+            sep=delimiter,
+            header=header,
+            skiprows=skiprows,
+            nrows=nrows,
+            dtype=dtype,
+            parse_dates=parse_dates,
+            low_memory=False,  # Read entire file at once for consistent dtypes
+            **kwargs
+        )
+        
+        logger.info(f"Successfully read CSV: {len(df)} rows, {len(df.columns)} columns")
+        
+        return df
+        
+    except FileNotFoundError:
+        logger.error(f"CSV file not found: {file_path}")
+        raise
+    except pd.errors.EmptyDataError:
+        raise DataIngestionError(f"CSV file is empty: {file_path}")
+    except pd.errors.ParserError as e:
+        raise DataIngestionError(f"Failed to parse CSV file: {str(e)}")
+    except UnicodeDecodeError as e:
+        raise DataIngestionError(
+            f"Encoding error. Try different encoding (current: {encoding}). "
+            f"Common alternatives: 'latin1', 'iso-8859-1', 'cp1252'. Error: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error reading CSV: {str(e)}", exc_info=True)
+        raise DataIngestionError(f"Failed to read CSV file: {str(e)}") from e
+
+
+def save_file_to_raw(
+    source_path: Union[str, Path],
+    destination_name: Optional[str] = None,
+    raw_data_dir: Union[str, Path] = "data/raw",
+    overwrite: bool = False,
+    add_timestamp: bool = True,
+    create_dir: bool = True,
+    copy_mode: bool = True
+) -> Dict[str, Any]:
+    """
+    Save/copy a file to the data/raw directory with production-level handling.
+    
+    This function handles file operations for ingesting data files into the
+    raw data directory with proper validation, naming conventions, and metadata tracking.
+    
+    Args:
+        source_path: Path to the source file to save
+        destination_name: Custom name for destination file (if None, uses source filename)
+        raw_data_dir: Path to the raw data directory (default: 'data/raw')
+        overwrite: Whether to overwrite if destination file exists (default: False)
+        add_timestamp: Add timestamp to filename to prevent overwrites (default: True)
+        create_dir: Create raw_data_dir if it doesn't exist (default: True)
+        copy_mode: If True, copy the file; if False, move the file (default: True)
+    
+    Returns:
+        Dictionary containing:
+            - status: 'success'
+            - source_path: Original file path
+            - destination_path: Final destination path
+            - file_size_mb: File size in MB
+            - file_hash: SHA-256 hash of the file
+            - timestamp: ISO format timestamp of operation
+            - operation: 'copy' or 'move'
+    
+    Raises:
+        FileNotFoundError: If source file doesn't exist
+        DataIngestionError: If file operation fails
+    
+    Example:
+        >>> # Copy file to data/raw with timestamp
+        >>> result = save_file_to_raw('uploads/new_data.csv')
+        >>> print(f"Saved to: {result['destination_path']}")
+        >>> 
+        >>> # Move file with custom name, no timestamp
+        >>> result = save_file_to_raw(
+        ...     'temp/data.csv',
+        ...     destination_name='sales_data.csv',
+        ...     add_timestamp=False,
+        ...     copy_mode=False
+        ... )
+        >>> 
+        >>> # Overwrite existing file
+        >>> result = save_file_to_raw(
+        ...     'new_file.csv',
+        ...     destination_name='existing.csv',
+        ...     overwrite=True,
+        ...     add_timestamp=False
+        ... )
+    """
+    source_path = Path(source_path)
+    raw_data_dir = Path(raw_data_dir)
+    
+    try:
+        # Step 1: Validate source file
+        logger.info(f"Saving file to raw directory: {source_path}")
+        _validate_file_exists(source_path)
+        
+        # Step 2: Create destination directory if needed
+        if create_dir and not raw_data_dir.exists():
+            logger.info(f"Creating raw data directory: {raw_data_dir}")
+            raw_data_dir.mkdir(parents=True, exist_ok=True)
+        
+        if not raw_data_dir.exists():
+            raise DataIngestionError(
+                f"Raw data directory does not exist: {raw_data_dir}. "
+                f"Set create_dir=True to create it automatically."
+            )
+        
+        # Step 3: Determine destination filename
+        if destination_name:
+            base_name = destination_name
+        else:
+            base_name = source_path.name
+        
+        # Step 4: Add timestamp if requested
+        if add_timestamp and not overwrite:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            name_parts = base_name.rsplit('.', 1)
+            if len(name_parts) == 2:
+                base_name = f"{name_parts[0]}_{timestamp_str}.{name_parts[1]}"
+            else:
+                base_name = f"{base_name}_{timestamp_str}"
+        
+        destination_path = raw_data_dir / base_name
+        
+        # Step 5: Check if destination exists and handle accordingly
+        if destination_path.exists() and not overwrite:
+            raise DataIngestionError(
+                f"Destination file already exists: {destination_path}. "
+                f"Set overwrite=True or add_timestamp=True to avoid conflicts."
+            )
+        
+        # Step 6: Calculate file metadata before operation
+        file_size_mb = _get_file_size_mb(source_path)
+        file_hash = _calculate_file_hash(source_path)
+        
+        # Step 7: Perform file operation
+        operation_start = datetime.now()
+        
+        if copy_mode:
+            logger.info(f"Copying file to: {destination_path}")
+            shutil.copy2(source_path, destination_path)  # copy2 preserves metadata
+            operation = 'copy'
+        else:
+            logger.info(f"Moving file to: {destination_path}")
+            shutil.move(str(source_path), str(destination_path))
+            operation = 'move'
+        
+        operation_end = datetime.now()
+        operation_duration = (operation_end - operation_start).total_seconds()
+        
+        # Step 8: Verify destination file
+        if not destination_path.exists():
+            raise DataIngestionError(f"File operation failed: destination file not found")
+        
+        # Verify integrity by comparing hash
+        dest_hash = _calculate_file_hash(destination_path)
+        if dest_hash != file_hash:
+            logger.error("File integrity check failed: hash mismatch")
+            # Clean up corrupted file
+            if destination_path.exists():
+                destination_path.unlink()
+            raise DataIngestionError("File integrity verification failed")
+        
+        logger.info(
+            f"Successfully {operation}ed file to {destination_path} "
+            f"({file_size_mb:.2f} MB) in {operation_duration:.2f} seconds"
+        )
+        
+        # Step 9: Return operation metadata
+        return {
+            'status': 'success',
+            'operation': operation,
+            'source_path': str(source_path.absolute()),
+            'destination_path': str(destination_path.absolute()),
+            'file_name': destination_path.name,
+            'file_size_bytes': destination_path.stat().st_size,
+            'file_size_mb': round(file_size_mb, 2),
+            'file_hash': file_hash,
+            'timestamp': datetime.now().isoformat(),
+            'operation_duration_seconds': round(operation_duration, 2),
+        }
+        
+    except FileNotFoundError:
+        logger.error(f"Source file not found: {source_path}")
+        raise
+    except PermissionError as e:
+        logger.error(f"Permission denied: {str(e)}")
+        raise DataIngestionError(f"Permission denied while saving file: {str(e)}") from e
+    except OSError as e:
+        logger.error(f"OS error during file operation: {str(e)}")
+        raise DataIngestionError(f"File system error: {str(e)}") from e
+    except Exception as e:
+        logger.error(f"Unexpected error saving file: {str(e)}", exc_info=True)
+        raise DataIngestionError(f"Failed to save file to raw directory: {str(e)}") from e
+
+
+def ingest_csv_to_raw(
+    source_path: Union[str, Path],
+    validate_data: bool = True,
+    save_to_db: bool = False,
+    db_table: Optional[str] = None,
+    database_url: Optional[str] = None,
+    **save_options
+) -> Dict[str, Any]:
+    """
+    Complete CSV ingestion workflow: read, validate, save to raw, and optionally to database.
+    
+    This is a high-level function that orchestrates the complete ingestion process
+    for CSV files in a production environment.
+    
+    Args:
+        source_path: Path to the source CSV file
+        validate_data: Whether to validate the CSV data (default: True)
+        save_to_db: Whether to save data to database (default: False)
+        db_table: Database table name (required if save_to_db=True)
+        database_url: Database connection URL (if None, uses config)
+        **save_options: Additional options for save_file_to_raw()
+    
+    Returns:
+        Dictionary containing complete ingestion results including:
+            - file_operation: Results from save_file_to_raw()
+            - data_load: Results from load_raw_data()
+            - database_save: Results from save_to_database() if applicable
+            - status: Overall status
+    
+    Raises:
+        DataIngestionError: If any step of the ingestion fails
+    
+    Example:
+        >>> # Basic ingestion: validate and save to raw
+        >>> result = ingest_csv_to_raw('uploads/sales.csv')
+        >>> print(f"File saved to: {result['file_operation']['destination_path']}")
+        >>> print(f"Rows loaded: {result['data_load']['row_count']}")
+        >>> 
+        >>> # Full ingestion: save to raw and database
+        >>> result = ingest_csv_to_raw(
+        ...     'uploads/sales.csv',
+        ...     save_to_db=True,
+        ...     db_table='raw_sales_data',
+        ...     destination_name='sales_latest.csv'
+        ... )
+    """
+    try:
+        logger.info(f"Starting complete CSV ingestion workflow for: {source_path}")
+        start_time = datetime.now()
+        
+        result = {
+            'status': 'in_progress',
+            'source_file': str(source_path),
+            'steps_completed': []
+        }
+        
+        # Step 1: Save file to raw directory
+        logger.info("Step 1: Saving file to raw directory...")
+        file_operation = save_file_to_raw(source_path, **save_options)
+        result['file_operation'] = file_operation
+        result['steps_completed'].append('file_saved')
+        
+        destination_path = file_operation['destination_path']
+        
+        # Step 2: Load and validate data
+        logger.info("Step 2: Loading and validating data...")
+        data_load = load_raw_data(
+            file_path=destination_path,
+            validate=validate_data
+        )
+        result['data_load'] = {
+            'row_count': data_load['row_count'],
+            'column_count': data_load['column_count'],
+            'file_hash': data_load['metadata']['file_hash'],
+            'validation_passed': data_load['validation_results'].get('is_valid', True),
+            'warnings': data_load['warnings']
+        }
+        result['steps_completed'].append('data_loaded')
+        
+        # Step 3: Save to database if requested
+        if save_to_db:
+            if not db_table:
+                raise DataIngestionError("db_table parameter is required when save_to_db=True")
+            
+            logger.info(f"Step 3: Saving data to database table '{db_table}'...")
+            
+            # Use provided database_url or fall back to config
+            if database_url is None:
+                try:
+                    from config import config
+                    database_url = config.DATABASE_URL
+                except ImportError:
+                    raise DataIngestionError(
+                        "database_url not provided and config module not available"
+                    )
+            
+            db_save = save_to_database(
+                data=data_load['data'],
+                table_name=db_table,
+                database_url=database_url
+            )
+            result['database_save'] = db_save
+            result['steps_completed'].append('data_saved_to_db')
+        
+        # Calculate total duration
+        end_time = datetime.now()
+        total_duration = (end_time - start_time).total_seconds()
+        
+        result['status'] = 'success'
+        result['total_duration_seconds'] = round(total_duration, 2)
+        result['completed_at'] = datetime.now().isoformat()
+        
+        logger.info(
+            f"CSV ingestion workflow completed successfully in {total_duration:.2f} seconds. "
+            f"Steps: {', '.join(result['steps_completed'])}"
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"CSV ingestion workflow failed: {str(e)}", exc_info=True)
+        result['status'] = 'failed'
+        result['error'] = str(e)
+        raise DataIngestionError(f"CSV ingestion workflow failed: {str(e)}") from e
+
+
 if __name__ == "__main__":
     """
     Example usage and testing of the data ingestion module.
     """
-    # Example 1: Load a CSV file
-    print("\n" + "="*60)
-    print("Data Ingestion Module - Example Usage")
-    print("="*60 + "\n")
+    print("\n" + "="*70)
+    print("Data Ingestion Module - Production Examples")
+    print("="*70 + "\n")
     
+    # Example 1: Read CSV data
+    print("Example 1: Read CSV data")
+    print("-" * 70)
     try:
-        # Example file path (adjust as needed)
+        example_csv = Path("data/raw/example_data.csv")
+        
+        if example_csv.exists():
+            # Read CSV with default settings
+            df = read_csv_data(example_csv)
+            print(f"✓ Successfully read CSV: {len(df)} rows, {len(df.columns)} columns")
+            print(f"  Columns: {', '.join(df.columns.tolist()[:5])}")
+            if len(df.columns) > 5:
+                print(f"           ... and {len(df.columns) - 5} more")
+            print(f"\n  First 3 rows:")
+            print(df.head(3).to_string(index=False))
+        else:
+            print(f"ℹ Example CSV not found: {example_csv}")
+            print("  Create a CSV file in data/raw/ to test CSV reading")
+    except Exception as e:
+        print(f"✗ Error: {str(e)}")
+    
+    print("\n")
+    
+    # Example 2: Save file to raw directory
+    print("Example 2: Save file to data/raw directory")
+    print("-" * 70)
+    try:
+        # Create a sample CSV for demonstration
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='') as f:
+            f.write("id,name,value\n")
+            f.write("1,Product A,100\n")
+            f.write("2,Product B,200\n")
+            f.write("3,Product C,300\n")
+            temp_file = Path(f.name)
+        
+        # Save to raw directory with timestamp
+        result = save_file_to_raw(
+            source_path=temp_file,
+            destination_name="sample_data.csv",
+            add_timestamp=True,
+            copy_mode=True
+        )
+        
+        print(f"✓ File saved successfully")
+        print(f"  Operation: {result['operation']}")
+        print(f"  Destination: {result['file_name']}")
+        print(f"  Size: {result['file_size_mb']} MB")
+        print(f"  Hash: {result['file_hash'][:16]}...")
+        print(f"  Duration: {result['operation_duration_seconds']} seconds")
+        
+        # Clean up temp file
+        temp_file.unlink(missing_ok=True)
+        
+    except Exception as e:
+        print(f"✗ Error: {str(e)}")
+        if 'temp_file' in locals():
+            temp_file.unlink(missing_ok=True)
+    
+    print("\n")
+    
+    # Example 3: Complete ingestion workflow
+    print("Example 3: Complete CSV ingestion workflow")
+    print("-" * 70)
+    try:
         example_file = Path("data/raw/example_data.csv")
         
         if example_file.exists():
+            # Load with full validation
             result = load_raw_data(
                 file_path=example_file,
                 validate=True
             )
             
-            print(f"✓ Successfully loaded {result['row_count']} rows")
-            print(f"✓ Columns: {result['column_count']}")
-            print(f"✓ File size: {result['metadata']['file_size_mb']} MB")
-            print(f"✓ Processing time: {result['metadata']['processing_duration_seconds']} seconds")
-            print(f"✓ File hash: {result['metadata']['file_hash'][:16]}...")
+            print(f"✓ Complete ingestion workflow")
+            print(f"  Rows: {result['row_count']}")
+            print(f"  Columns: {result['column_count']}")
+            print(f"  File size: {result['metadata']['file_size_mb']} MB")
+            print(f"  Processing time: {result['metadata']['processing_duration_seconds']}s")
+            print(f"  File hash: {result['metadata']['file_hash'][:16]}...")
+            print(f"  Validation: {'✓ Passed' if result['validation_results'].get('is_valid', True) else '✗ Failed'}")
             
             if result['warnings']:
-                print(f"\n⚠ Warnings ({len(result['warnings'])}):")
-                for warning in result['warnings']:
-                    print(f"  - {warning}")
+                print(f"\n  ⚠ Warnings ({len(result['warnings'])}):")
+                for warning in result['warnings'][:3]:  # Show first 3 warnings
+                    print(f"    - {warning}")
+                if len(result['warnings']) > 3:
+                    print(f"    ... and {len(result['warnings']) - 3} more")
             
-            # Display data profile
-            print(f"\nData Preview:")
-            print(result['data'].head())
+            # Display data statistics
+            print(f"\n  Data Statistics:")
+            print(f"    Memory usage: {result['metadata']['memory_usage_mb']} MB")
+            
+            # Show column info
+            print(f"\n  Column Information:")
+            for col_info in result['metadata']['schema_info'][:5]:
+                null_pct = col_info['null_percentage']
+                null_indicator = f" ({null_pct}% null)" if null_pct > 0 else ""
+                print(f"    - {col_info['name']}: {col_info['dtype']}{null_indicator}")
+            
+            if len(result['metadata']['schema_info']) > 5:
+                print(f"    ... and {len(result['metadata']['schema_info']) - 5} more columns")
             
         else:
             print(f"ℹ Example file not found: {example_file}")
-            print("  Place a CSV file in data/raw/ to test the ingestion module")
+            print("  Place a CSV file in data/raw/ to test the complete workflow")
             
     except Exception as e:
         print(f"✗ Error: {str(e)}")
     
-    print("\n" + "="*60)
+    print("\n")
+    
+    # Example 4: Advanced CSV reading options
+    print("Example 4: Advanced CSV reading options")
+    print("-" * 70)
+    print("Available options for read_csv_data():")
+    print("  • encoding: 'utf-8', 'latin1', 'iso-8859-1', 'cp1252'")
+    print("  • delimiter: ',', ';', '|', '\\t' (tab)")
+    print("  • nrows: Read only first N rows (useful for testing)")
+    print("  • parse_dates: Parse date columns automatically")
+    print("  • dtype: Enforce specific data types for columns")
+    print("\nExample usage:")
+    print("  df = read_csv_data('file.csv', delimiter=';', nrows=1000)")
+    print("  df = read_csv_data('file.csv', parse_dates=['date_col'])")
+    print("  df = read_csv_data('file.csv', dtype={'id': str, 'value': float})")
+    
+    print("\n" + "="*70)
+    print("Production Features:")
+    print("  ✓ Multi-format support (CSV, JSON, Excel, Parquet)")
+    print("  ✓ Automatic file validation and integrity checks")
+    print("  ✓ Data quality validation and profiling")
+    print("  ✓ File saving with timestamp and hash verification")
+    print("  ✓ Comprehensive error handling and logging")
+    print("  ✓ Database integration support")
+    print("="*70 + "\n")
