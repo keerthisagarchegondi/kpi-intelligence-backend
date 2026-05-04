@@ -943,6 +943,441 @@ def convert_data_types(
     return df, report
 
 
+def standardize_columns(
+    df: pd.DataFrame,
+    column_mapping: Optional[Dict[str, str]] = None,
+    expected_columns: Optional[List[str]] = None,
+    date_columns: Optional[List[str]] = None,
+    date_format: Optional[str] = None,
+    currency_columns: Optional[List[str]] = None,
+    currency_symbol: str = '$',
+    phone_columns: Optional[List[str]] = None,
+    email_columns: Optional[List[str]] = None,
+    categorical_mappings: Optional[Dict[str, Dict[str, Any]]] = None,
+    case_sensitive: bool = False,
+    strict_mode: bool = False,
+    auto_detect_types: bool = True,
+    inplace: bool = False
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Comprehensive column standardization function for production-level data processing.
+    
+    This function provides advanced column standardization including:
+    - Column name standardization and mapping
+    - Data type detection and conversion
+    - Date format standardization
+    - Currency/numeric format standardization
+    - Phone number formatting
+    - Email validation and standardization
+    - Categorical value mapping and standardization
+    - Schema validation against expected columns
+    
+    Args:
+        df: Input DataFrame to standardize
+        column_mapping: Dictionary mapping current column names to standardized names
+        expected_columns: List of expected column names for validation
+        date_columns: List of column names containing dates to standardize
+        date_format: Target date format (e.g., '%Y-%m-%d'). If None, uses ISO format
+        currency_columns: List of columns containing currency values to clean
+        currency_symbol: Currency symbol to remove (default: '$')
+        phone_columns: List of columns containing phone numbers to format
+        email_columns: List of columns containing email addresses to validate
+        categorical_mappings: Dict of {column_name: {old_value: new_value}} for standardizing categories
+        case_sensitive: Whether column name matching is case-sensitive
+        strict_mode: If True, raise errors for missing expected columns
+        auto_detect_types: Automatically detect and convert data types
+        inplace: Modify DataFrame in place (default: False)
+    
+    Returns:
+        Tuple of (standardized_dataframe, standardization_report)
+        
+    Raises:
+        DataTransformationError: If strict_mode is True and validation fails
+        ValueError: If invalid parameters are provided
+    
+    Example:
+        >>> # Basic column name standardization
+        >>> df, report = standardize_columns(df, column_mapping={'OldName': 'new_name'})
+        >>> 
+        >>> # Comprehensive standardization with type conversion
+        >>> df, report = standardize_columns(
+        ...     df,
+        ...     date_columns=['order_date', 'ship_date'],
+        ...     currency_columns=['price', 'total'],
+        ...     categorical_mappings={
+        ...         'status': {'active': 'ACTIVE', 'inactive': 'INACTIVE'}
+        ...     }
+        ... )
+        >>> print(f"Columns standardized: {report['columns_modified']}")
+    """
+    start_time = datetime.now()
+    
+    # Validate input
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError("Input must be a pandas DataFrame")
+    
+    if df.empty:
+        logger.warning("Input DataFrame is empty")
+        return df, {'status': 'skipped', 'reason': 'empty_dataframe'}
+    
+    # Work on copy unless inplace is True
+    if not inplace:
+        df = df.copy()
+    
+    # Initialize report
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'columns_before': len(df.columns),
+        'columns_after': 0,
+        'columns_modified': 0,
+        'columns_renamed': {},
+        'columns_added': [],
+        'columns_removed': [],
+        'type_conversions': {},
+        'format_standardizations': {},
+        'validation_results': {},
+        'warnings': [],
+        'errors': [],
+        'actions_taken': []
+    }
+    
+    try:
+        logger.info(f"Starting column standardization: {len(df.columns)} columns")
+        
+        # Step 1: Standardize column names
+        original_columns = df.columns.tolist()
+        
+        # First, apply basic standardization
+        df.columns = (
+            df.columns
+            .str.strip()
+            .str.lower() if not case_sensitive else df.columns.str.strip()
+        )
+        
+        # Remove special characters and standardize format
+        df.columns = (
+            df.columns
+            .str.replace(r'\s+', '_', regex=True)  # Spaces to underscores
+            .str.replace(r'[^\w\s]', '', regex=True)  # Remove special chars
+            .str.replace(r'_+', '_', regex=True)  # Multiple underscores to single
+            .str.strip('_')  # Remove leading/trailing underscores
+        )
+        
+        # Track renamed columns
+        for old, new in zip(original_columns, df.columns):
+            if old != new:
+                report['columns_renamed'][old] = new
+        
+        if report['columns_renamed']:
+            report['actions_taken'].append(
+                f"Standardized {len(report['columns_renamed'])} column names"
+            )
+            logger.info(f"Standardized {len(report['columns_renamed'])} column names")
+        
+        # Step 2: Apply custom column mapping
+        if column_mapping:
+            mapping_lower = {}
+            if not case_sensitive:
+                # Create lowercase mapping for case-insensitive matching
+                current_cols = {col.lower(): col for col in df.columns}
+                for old_name, new_name in column_mapping.items():
+                    old_lower = old_name.lower()
+                    if old_lower in current_cols:
+                        actual_col = current_cols[old_lower]
+                        mapping_lower[actual_col] = new_name.lower().replace(' ', '_')
+                df.rename(columns=mapping_lower, inplace=True)
+            else:
+                # Direct mapping for case-sensitive
+                safe_mapping = {
+                    k: v.lower().replace(' ', '_') for k, v in column_mapping.items()
+                    if k in df.columns
+                }
+                df.rename(columns=safe_mapping, inplace=True)
+            
+            applied_mappings = len(mapping_lower) if not case_sensitive else len(safe_mapping)
+            if applied_mappings > 0:
+                report['actions_taken'].append(
+                    f"Applied custom mapping to {applied_mappings} columns"
+                )
+                report['columns_renamed'].update(
+                    mapping_lower if not case_sensitive else safe_mapping
+                )
+                logger.info(f"Applied custom column mapping: {applied_mappings} columns")
+        
+        # Step 3: Validate against expected columns
+        if expected_columns:
+            expected_set = set([col.lower() for col in expected_columns]) if not case_sensitive else set(expected_columns)
+            actual_set = set([col.lower() for col in df.columns]) if not case_sensitive else set(df.columns)
+            
+            missing_columns = expected_set - actual_set
+            extra_columns = actual_set - expected_set
+            
+            report['validation_results']['expected_columns'] = list(expected_columns)
+            report['validation_results']['missing_columns'] = list(missing_columns)
+            report['validation_results']['extra_columns'] = list(extra_columns)
+            report['validation_results']['match_percentage'] = round(
+                (len(expected_set & actual_set) / len(expected_set)) * 100, 2
+            ) if expected_columns else 100
+            
+            if missing_columns:
+                msg = f"Missing expected columns: {list(missing_columns)}"
+                if strict_mode:
+                    raise DataTransformationError(msg)
+                else:
+                    report['warnings'].append(msg)
+                    logger.warning(msg)
+            
+            if extra_columns:
+                report['warnings'].append(f"Extra columns found: {list(extra_columns)}")
+                logger.info(f"Extra columns: {list(extra_columns)}")
+            
+            if not missing_columns and not extra_columns:
+                report['actions_taken'].append("All expected columns present")
+                logger.info("Column validation passed: all expected columns present")
+        
+        # Step 4: Standardize date columns
+        if date_columns:
+            for col in date_columns:
+                if col not in df.columns:
+                    report['warnings'].append(f"Date column '{col}' not found")
+                    continue
+                
+                try:
+                    # Convert to datetime
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                    
+                    # Format if specified
+                    if date_format:
+                        df[col] = df[col].dt.strftime(date_format)
+                    
+                    report['format_standardizations'][col] = 'date'
+                    report['type_conversions'][col] = {
+                        'to': 'datetime64' if not date_format else 'string (formatted)',
+                        'format': date_format if date_format else 'ISO 8601'
+                    }
+                    report['columns_modified'] += 1
+                    
+                    # Check for conversion failures
+                    null_count = df[col].isnull().sum()
+                    if null_count > 0:
+                        report['warnings'].append(
+                            f"Column '{col}': {null_count} values could not be converted to date"
+                        )
+                    
+                except Exception as e:
+                    report['errors'].append(f"Failed to standardize date column '{col}': {str(e)}")
+                    logger.error(f"Date standardization failed for '{col}': {e}")
+            
+            if report['format_standardizations']:
+                report['actions_taken'].append(
+                    f"Standardized {len([k for k, v in report['format_standardizations'].items() if v == 'date'])} date columns"
+                )
+        
+        # Step 5: Standardize currency columns
+        if currency_columns:
+            for col in currency_columns:
+                if col not in df.columns:
+                    report['warnings'].append(f"Currency column '{col}' not found")
+                    continue
+                
+                try:
+                    # Remove currency symbols and convert to float
+                    if df[col].dtype == 'object':
+                        df[col] = (
+                            df[col]
+                            .astype(str)
+                            .str.replace(currency_symbol, '', regex=False)
+                            .str.replace(',', '')
+                            .str.strip()
+                        )
+                    
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    report['format_standardizations'][col] = 'currency'
+                    report['type_conversions'][col] = {'to': 'float64', 'cleaned': True}
+                    report['columns_modified'] += 1
+                    
+                    # Check for conversion failures
+                    null_count = df[col].isnull().sum()
+                    if null_count > 0:
+                        report['warnings'].append(
+                            f"Column '{col}': {null_count} values could not be converted to numeric"
+                        )
+                    
+                except Exception as e:
+                    report['errors'].append(f"Failed to standardize currency column '{col}': {str(e)}")
+                    logger.error(f"Currency standardization failed for '{col}': {e}")
+            
+            if 'currency' in report['format_standardizations'].values():
+                currency_count = len([k for k, v in report['format_standardizations'].items() if v == 'currency'])
+                report['actions_taken'].append(f"Standardized {currency_count} currency columns")
+        
+        # Step 6: Standardize phone columns
+        if phone_columns:
+            for col in phone_columns:
+                if col not in df.columns:
+                    report['warnings'].append(f"Phone column '{col}' not found")
+                    continue
+                
+                try:
+                    # Remove common phone formatting characters, keep only digits
+                    df[col] = (
+                        df[col]
+                        .astype(str)
+                        .str.replace(r'[\s\-\(\)\.]', '', regex=True)
+                        .str.replace(r'[^\d]', '', regex=True)
+                    )
+                    
+                    report['format_standardizations'][col] = 'phone'
+                    report['columns_modified'] += 1
+                    
+                except Exception as e:
+                    report['errors'].append(f"Failed to standardize phone column '{col}': {str(e)}")
+                    logger.error(f"Phone standardization failed for '{col}': {e}")
+            
+            if 'phone' in report['format_standardizations'].values():
+                phone_count = len([k for k, v in report['format_standardizations'].items() if v == 'phone'])
+                report['actions_taken'].append(f"Standardized {phone_count} phone columns")
+        
+        # Step 7: Standardize email columns
+        if email_columns:
+            for col in email_columns:
+                if col not in df.columns:
+                    report['warnings'].append(f"Email column '{col}' not found")
+                    continue
+                
+                try:
+                    # Lowercase and strip whitespace
+                    df[col] = df[col].astype(str).str.lower().str.strip()
+                    
+                    # Basic email validation (check for @ symbol)
+                    invalid_count = (~df[col].str.contains('@', na=False)).sum()
+                    if invalid_count > 0:
+                        report['warnings'].append(
+                            f"Column '{col}': {invalid_count} values do not appear to be valid emails"
+                        )
+                    
+                    report['format_standardizations'][col] = 'email'
+                    report['columns_modified'] += 1
+                    
+                except Exception as e:
+                    report['errors'].append(f"Failed to standardize email column '{col}': {str(e)}")
+                    logger.error(f"Email standardization failed for '{col}': {e}")
+            
+            if 'email' in report['format_standardizations'].values():
+                email_count = len([k for k, v in report['format_standardizations'].items() if v == 'email'])
+                report['actions_taken'].append(f"Standardized {email_count} email columns")
+        
+        # Step 8: Apply categorical value mappings
+        if categorical_mappings:
+            for col, value_mapping in categorical_mappings.items():
+                if col not in df.columns:
+                    report['warnings'].append(f"Categorical column '{col}' not found")
+                    continue
+                
+                try:
+                    # Apply mapping
+                    df[col] = df[col].map(value_mapping).fillna(df[col])
+                    
+                    report['format_standardizations'][col] = 'categorical'
+                    report['columns_modified'] += 1
+                    
+                    logger.info(f"Applied categorical mapping to column '{col}'")
+                    
+                except Exception as e:
+                    report['errors'].append(f"Failed to apply categorical mapping to '{col}': {str(e)}")
+                    logger.error(f"Categorical mapping failed for '{col}': {e}")
+            
+            if 'categorical' in report['format_standardizations'].values():
+                cat_count = len([k for k, v in report['format_standardizations'].items() if v == 'categorical'])
+                report['actions_taken'].append(f"Standardized {cat_count} categorical columns")
+        
+        # Step 9: Auto-detect and convert data types
+        if auto_detect_types:
+            converted_count = 0
+            for col in df.columns:
+                if col in report['type_conversions']:
+                    # Skip columns already converted
+                    continue
+                
+                try:
+                    original_dtype = str(df[col].dtype)
+                    
+                    # Try to convert object columns to more specific types
+                    if df[col].dtype == 'object':
+                        # Try numeric conversion
+                        try:
+                            numeric_col = pd.to_numeric(df[col], errors='coerce')
+                            if numeric_col.notna().sum() / len(df) > 0.9:  # 90% conversion success
+                                df[col] = numeric_col
+                                report['type_conversions'][col] = {
+                                    'from': original_dtype,
+                                    'to': 'numeric (auto-detected)'
+                                }
+                                converted_count += 1
+                                continue
+                        except:
+                            pass
+                        
+                        # Try datetime conversion
+                        try:
+                            datetime_col = pd.to_datetime(df[col], errors='coerce')
+                            if datetime_col.notna().sum() / len(df) > 0.9:  # 90% conversion success
+                                df[col] = datetime_col
+                                report['type_conversions'][col] = {
+                                    'from': original_dtype,
+                                    'to': 'datetime (auto-detected)'
+                                }
+                                converted_count += 1
+                                continue
+                        except:
+                            pass
+                
+                except Exception as e:
+                    logger.debug(f"Auto-detection skipped for column '{col}': {e}")
+            
+            if converted_count > 0:
+                report['actions_taken'].append(
+                    f"Auto-detected and converted {converted_count} column types"
+                )
+                logger.info(f"Auto-detected {converted_count} column types")
+        
+        # Step 10: Final statistics
+        report['columns_after'] = len(df.columns)
+        report['columns_renamed_count'] = len(report['columns_renamed'])
+        report['format_standardizations_count'] = len(report['format_standardizations'])
+        report['type_conversions_count'] = len(report['type_conversions'])
+        
+        # Calculate success metrics
+        if report['columns_modified'] == 0:
+            report['columns_modified'] = len(report['columns_renamed'])
+        
+        report['success_rate'] = round(
+            ((report['columns_modified'] - len(report['errors'])) / 
+             max(report['columns_modified'], 1)) * 100, 2
+        ) if report['columns_modified'] > 0 else 100
+        
+        # Calculate processing duration
+        end_time = datetime.now()
+        report['processing_duration_seconds'] = round((end_time - start_time).total_seconds(), 3)
+        report['status'] = 'success'
+        
+        logger.info(
+            f"Column standardization completed: {report['columns_after']} columns, "
+            f"{report['columns_modified']} modified, "
+            f"{len(report['errors'])} errors, "
+            f"success rate: {report['success_rate']}%"
+        )
+        
+        return df, report
+        
+    except Exception as e:
+        logger.error(f"Column standardization failed: {str(e)}", exc_info=True)
+        report['status'] = 'failed'
+        report['error'] = str(e)
+        raise DataTransformationError(f"Column standardization failed: {str(e)}") from e
+
+
 if __name__ == "__main__":
     """
     Example usage and testing of the data transformation module.
