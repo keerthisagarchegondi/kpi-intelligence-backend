@@ -686,6 +686,601 @@ def calculate_conversion_rate(
     return round(float(conversion_rate), round_decimals)
 
 
+def calculate_retention(
+    df: pd.DataFrame,
+    user_column: str = 'user_id',
+    date_column: str = 'date',
+    event_column: Optional[str] = None,
+    cohort_period: Union[str, AggregationPeriod] = AggregationPeriod.MONTHLY,
+    retention_periods: int = 12,
+    method: str = 'cohort',
+    min_activity_threshold: int = 1,
+    include_cohort_size: bool = True,
+    return_format: str = 'dataframe',
+    round_decimals: int = 2,
+    validate_data: bool = True
+) -> Union[pd.DataFrame, Dict[str, Any], float]:
+    """
+    Calculate customer/user retention rate with multiple methods and production-level features.
+    
+    Retention analysis measures how many users continue to engage with a product or service
+    over time. This function supports multiple retention calculation methods:
+    
+    - **Cohort-based retention**: Track retention by user acquisition cohorts over time
+    - **Simple retention**: Overall retention rate between two time periods
+    - **Rolling retention**: Users active in each period regardless of gaps
+    - **N-day retention**: Retention at specific day intervals (Day 1, Day 7, Day 30)
+    
+    Args:
+        df: Input DataFrame with user activity data
+        user_column: Name of column containing user/customer IDs
+        date_column: Name of column containing dates
+        event_column: Optional column for event types (for filtering)
+        cohort_period: Time period for cohort grouping ('D', 'W', 'M', 'Q', 'Y')
+        retention_periods: Number of periods to calculate retention for
+        method: Retention calculation method:
+            - 'cohort': Cohort-based retention analysis (default)
+            - 'simple': Simple retention rate calculation
+            - 'rolling': Rolling retention (active in period regardless of gaps)
+            - 'n_day': N-day retention (specific intervals)
+        min_activity_threshold: Minimum events to consider user as active
+        include_cohort_size: Include cohort size information in results
+        return_format: Output format ('dataframe', 'dict', 'matrix', 'rate')
+        round_decimals: Number of decimal places for rounding
+        validate_data: Perform data validation before calculation
+    
+    Returns:
+        - DataFrame: Retention cohort matrix or time series (default)
+        - Dict: Comprehensive retention report with metrics
+        - float: Single retention rate value (for 'rate' format)
+        - np.ndarray: Retention matrix as numpy array (for 'matrix' format)
+    
+    Raises:
+        KPICalculationError: If calculation fails or data validation fails
+        ValueError: If invalid parameters or missing required columns
+    
+    Examples:
+        >>> # Cohort-based retention analysis
+        >>> retention_df = calculate_retention(
+        ...     df,
+        ...     user_column='customer_id',
+        ...     date_column='purchase_date',
+        ...     cohort_period='M',
+        ...     retention_periods=6
+        ... )
+        >>> print(retention_df)
+        
+        >>> # Simple retention rate
+        >>> retention_rate = calculate_retention(
+        ...     df,
+        ...     user_column='user_id',
+        ...     date_column='activity_date',
+        ...     method='simple',
+        ...     return_format='rate'
+        ... )
+        >>> print(f"Retention Rate: {retention_rate}%")
+        
+        >>> # Detailed retention report
+        >>> report = calculate_retention(
+        ...     df,
+        ...     user_column='user_id',
+        ...     date_column='login_date',
+        ...     method='cohort',
+        ...     return_format='dict'
+        ... )
+        >>> print(f"Average Retention: {report['average_retention']}%")
+        >>> print(f"Total Cohorts: {report['cohort_count']}")
+        
+        >>> # N-day retention (Day 1, 7, 14, 30)
+        >>> nday_retention = calculate_retention(
+        ...     df,
+        ...     user_column='user_id',
+        ...     date_column='signup_date',
+        ...     method='n_day',
+        ...     retention_periods=30
+        ... )
+        >>> print(nday_retention)
+    """
+    start_time = datetime.now()
+    
+    # Input validation
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError("Input must be a pandas DataFrame")
+    
+    if df.empty:
+        logger.warning("Input DataFrame is empty")
+        return _return_empty_retention(return_format)
+    
+    # Check required columns
+    if user_column not in df.columns:
+        raise ValueError(
+            f"User column '{user_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    
+    if date_column not in df.columns:
+        raise ValueError(
+            f"Date column '{date_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    
+    if event_column and event_column not in df.columns:
+        raise ValueError(
+            f"Event column '{event_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    
+    # Convert period string to enum if needed
+    if isinstance(cohort_period, str):
+        try:
+            cohort_period = AggregationPeriod(cohort_period.upper())
+        except ValueError:
+            # Allow pandas frequency strings
+            pass
+    
+    # Validate method
+    valid_methods = ['cohort', 'simple', 'rolling', 'n_day']
+    if method not in valid_methods:
+        raise ValueError(
+            f"Invalid method: {method}. Valid options: {valid_methods}"
+        )
+    
+    try:
+        logger.info(
+            f"Calculating retention: method={method}, "
+            f"users={df[user_column].nunique()}, records={len(df)}"
+        )
+        
+        # Work on a copy
+        df_work = df.copy()
+        
+        # Data validation and cleaning
+        if validate_data:
+            _validate_retention_data(df_work, user_column, date_column)
+        
+        # Convert date column to datetime
+        df_work[date_column] = pd.to_datetime(df_work[date_column], errors='coerce')
+        
+        # Remove rows with invalid dates
+        initial_count = len(df_work)
+        df_work = df_work.dropna(subset=[date_column])
+        dropped_count = initial_count - len(df_work)
+        
+        if dropped_count > 0:
+            logger.warning(f"Dropped {dropped_count} rows with invalid dates")
+        
+        # Remove null user IDs
+        df_work = df_work.dropna(subset=[user_column])
+        
+        if len(df_work) == 0:
+            logger.warning("No valid data after cleaning")
+            return _return_empty_retention(return_format)
+        
+        # Filter by event type if specified
+        if event_column:
+            logger.info(f"Filtering by event column: {event_column}")
+        
+        # Calculate based on method
+        if method == 'cohort':
+            result = _calculate_cohort_retention(
+                df_work,
+                user_column,
+                date_column,
+                cohort_period,
+                retention_periods,
+                min_activity_threshold,
+                include_cohort_size,
+                round_decimals
+            )
+        
+        elif method == 'simple':
+            result = _calculate_simple_retention(
+                df_work,
+                user_column,
+                date_column,
+                cohort_period,
+                round_decimals
+            )
+        
+        elif method == 'rolling':
+            result = _calculate_rolling_retention(
+                df_work,
+                user_column,
+                date_column,
+                cohort_period,
+                retention_periods,
+                round_decimals
+            )
+        
+        elif method == 'n_day':
+            result = _calculate_nday_retention(
+                df_work,
+                user_column,
+                date_column,
+                retention_periods,
+                round_decimals
+            )
+        
+        else:
+            raise ValueError(f"Method {method} not implemented")
+        
+        # Format output based on return_format
+        if return_format == 'rate' and isinstance(result, pd.DataFrame):
+            # Return average retention rate
+            numeric_cols = result.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                result = round(float(result[numeric_cols].mean().mean()), round_decimals)
+            else:
+                result = 0.0
+        
+        elif return_format == 'matrix' and isinstance(result, pd.DataFrame):
+            # Return as numpy array
+            numeric_cols = result.select_dtypes(include=[np.number]).columns
+            result = result[numeric_cols].values
+        
+        elif return_format == 'dict':
+            # Return comprehensive report
+            if isinstance(result, pd.DataFrame):
+                result = _create_retention_report(
+                    result,
+                    df_work,
+                    user_column,
+                    method,
+                    start_time,
+                    round_decimals
+                )
+            elif isinstance(result, dict):
+                # Already a dict, just add timing
+                result['processing_time_seconds'] = round(
+                    (datetime.now() - start_time).total_seconds(), 3
+                )
+        
+        logger.info(
+            f"Retention calculation completed: method={method}, "
+            f"result_type={type(result).__name__}"
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Retention calculation failed: {str(e)}", exc_info=True)
+        raise KPICalculationError(
+            f"Retention calculation failed: {str(e)}"
+        ) from e
+
+
+def _validate_retention_data(
+    df: pd.DataFrame,
+    user_column: str,
+    date_column: str
+) -> None:
+    """
+    Validate retention data for quality and completeness.
+    
+    Args:
+        df: DataFrame to validate
+        user_column: User column name
+        date_column: Date column name
+    
+    Raises:
+        ValueError: If validation fails
+    """
+    # Check for empty columns
+    if df[user_column].isnull().all():
+        raise ValueError(f"User column '{user_column}' contains only null values")
+    
+    if df[date_column].isnull().all():
+        raise ValueError(f"Date column '{date_column}' contains only null values")
+    
+    # Check for minimum data
+    unique_users = df[user_column].nunique()
+    if unique_users < 2:
+        logger.warning(
+            f"Only {unique_users} unique user(s) found. "
+            "Retention analysis may not be meaningful."
+        )
+
+
+def _return_empty_retention(return_format: str) -> Union[pd.DataFrame, Dict, float]:
+    """Return appropriate empty result based on format."""
+    if return_format == 'rate':
+        return 0.0
+    elif return_format == 'matrix':
+        return np.array([])
+    elif return_format == 'dict':
+        return {
+            'retention_rate': 0.0,
+            'status': 'no_data',
+            'message': 'No valid data for retention calculation'
+        }
+    else:  # dataframe
+        return pd.DataFrame()
+
+
+def _calculate_cohort_retention(
+    df: pd.DataFrame,
+    user_column: str,
+    date_column: str,
+    cohort_period: Union[str, AggregationPeriod],
+    retention_periods: int,
+    min_activity_threshold: int,
+    include_cohort_size: bool,
+    round_decimals: int
+) -> pd.DataFrame:
+    """
+    Calculate cohort-based retention.
+    
+    This tracks users by their acquisition cohort and measures what percentage
+    remains active in subsequent periods.
+    """
+    period_str = cohort_period.value if isinstance(cohort_period, AggregationPeriod) else cohort_period
+    
+    # Determine user's first activity date (cohort)
+    user_cohorts = df.groupby(user_column)[date_column].min().reset_index()
+    user_cohorts.columns = [user_column, 'cohort_date']
+    
+    # Assign cohort period
+    user_cohorts['cohort_period'] = user_cohorts['cohort_date'].dt.to_period(period_str)
+    
+    # Merge cohort info back to main dataframe
+    df_cohort = df.merge(user_cohorts[[user_column, 'cohort_period']], on=user_column)
+    
+    # Assign activity period
+    df_cohort['activity_period'] = df_cohort[date_column].dt.to_period(period_str)
+    
+    # Calculate period offset from cohort
+    df_cohort['period_offset'] = (
+        df_cohort['activity_period'].astype('int64') - 
+        df_cohort['cohort_period'].astype('int64')
+    )
+    
+    # Filter to retention_periods
+    df_cohort = df_cohort[df_cohort['period_offset'] <= retention_periods]
+    
+    # Count active users by cohort and period offset
+    cohort_activity = df_cohort.groupby(
+        ['cohort_period', 'period_offset']
+    )[user_column].nunique().reset_index()
+    cohort_activity.columns = ['cohort_period', 'period_offset', 'active_users']
+    
+    # Pivot to create retention matrix
+    retention_matrix = cohort_activity.pivot(
+        index='cohort_period',
+        columns='period_offset',
+        values='active_users'
+    )
+    
+    # Calculate retention percentages
+    cohort_sizes = retention_matrix[0]
+    retention_pct = retention_matrix.div(cohort_sizes, axis=0) * 100
+    
+    # Round values
+    retention_pct = retention_pct.round(round_decimals)
+    
+    # Rename columns
+    retention_pct.columns = [f'Period_{int(col)}' for col in retention_pct.columns]
+    
+    # Reset index to make cohort_period a column
+    retention_pct = retention_pct.reset_index()
+    retention_pct['cohort_period'] = retention_pct['cohort_period'].astype(str)
+    
+    # Add cohort sizes if requested
+    if include_cohort_size:
+        retention_pct.insert(1, 'cohort_size', cohort_sizes.values)
+    
+    return retention_pct
+
+
+def _calculate_simple_retention(
+    df: pd.DataFrame,
+    user_column: str,
+    date_column: str,
+    period: Union[str, AggregationPeriod],
+    round_decimals: int
+) -> pd.DataFrame:
+    """
+    Calculate simple period-over-period retention rate.
+    
+    Measures what percentage of users active in one period remain active in the next.
+    """
+    period_str = period.value if isinstance(period, AggregationPeriod) else period
+    
+    # Assign period to each activity
+    df['period'] = df[date_column].dt.to_period(period_str)
+    
+    # Get unique users per period
+    period_users = df.groupby('period')[user_column].apply(set).reset_index()
+    period_users.columns = ['period', 'users']
+    
+    # Calculate retention
+    retention_data = []
+    
+    for i in range(len(period_users) - 1):
+        current_period = period_users.iloc[i]
+        next_period = period_users.iloc[i + 1]
+        
+        current_users = current_period['users']
+        next_users = next_period['users']
+        
+        retained_users = current_users & next_users
+        retention_rate = (len(retained_users) / len(current_users) * 100) if len(current_users) > 0 else 0
+        
+        retention_data.append({
+            'period': str(current_period['period']),
+            'users': len(current_users),
+            'retained_users': len(retained_users),
+            'retention_rate': round(retention_rate, round_decimals)
+        })
+    
+    return pd.DataFrame(retention_data)
+
+
+def _calculate_rolling_retention(
+    df: pd.DataFrame,
+    user_column: str,
+    date_column: str,
+    period: Union[str, AggregationPeriod],
+    retention_periods: int,
+    round_decimals: int
+) -> pd.DataFrame:
+    """
+    Calculate rolling retention (users active in each period regardless of gaps).
+    """
+    period_str = period.value if isinstance(period, AggregationPeriod) else period
+    
+    # Assign period
+    df['period'] = df[date_column].dt.to_period(period_str)
+    
+    # Get active users per period
+    active_by_period = df.groupby('period')[user_column].apply(set).to_dict()
+    
+    # Sort periods
+    periods = sorted(active_by_period.keys())
+    
+    if len(periods) == 0:
+        return pd.DataFrame()
+    
+    # Calculate rolling retention from each starting period
+    rolling_data = []
+    
+    for i, start_period in enumerate(periods):
+        if i + retention_periods > len(periods):
+            break
+        
+        start_users = active_by_period[start_period]
+        
+        for offset in range(min(retention_periods + 1, len(periods) - i)):
+            target_period = periods[i + offset]
+            target_users = active_by_period[target_period]
+            
+            retained = start_users & target_users
+            retention_rate = (len(retained) / len(start_users) * 100) if len(start_users) > 0 else 0
+            
+            rolling_data.append({
+                'start_period': str(start_period),
+                'offset': offset,
+                'target_period': str(target_period),
+                'retention_rate': round(retention_rate, round_decimals)
+            })
+    
+    return pd.DataFrame(rolling_data)
+
+
+def _calculate_nday_retention(
+    df: pd.DataFrame,
+    user_column: str,
+    date_column: str,
+    max_days: int,
+    round_decimals: int
+) -> pd.DataFrame:
+    """
+    Calculate N-day retention (e.g., Day 1, Day 7, Day 30).
+    """
+    # Get user's first activity date
+    user_first_date = df.groupby(user_column)[date_column].min().reset_index()
+    user_first_date.columns = [user_column, 'first_date']
+    
+    # Merge back
+    df_nday = df.merge(user_first_date, on=user_column)
+    
+    # Calculate days since first activity
+    df_nday['days_since_first'] = (df_nday[date_column] - df_nday['first_date']).dt.days
+    
+    # Group users by their cohort date
+    cohorts = user_first_date.groupby('first_date')[user_column].apply(set).to_dict()
+    
+    # Calculate retention for each day
+    day_intervals = [1, 3, 7, 14, 30, 60, 90]
+    day_intervals = [d for d in day_intervals if d <= max_days]
+    
+    if max_days not in day_intervals and max_days <= 365:
+        day_intervals.append(max_days)
+    
+    retention_data = []
+    
+    for cohort_date, cohort_users in cohorts.items():
+        cohort_size = len(cohort_users)
+        
+        for day in day_intervals:
+            # Find users active on or after that day
+            target_date = cohort_date + timedelta(days=day)
+            
+            active_users = df_nday[
+                (df_nday['first_date'] == cohort_date) &
+                (df_nday[date_column] >= target_date) &
+                (df_nday[date_column] < target_date + timedelta(days=1))
+            ][user_column].nunique()
+            
+            retention_rate = (active_users / cohort_size * 100) if cohort_size > 0 else 0
+            
+            retention_data.append({
+                'cohort_date': cohort_date,
+                'day': day,
+                'cohort_size': cohort_size,
+                'retained_users': active_users,
+                'retention_rate': round(retention_rate, round_decimals)
+            })
+    
+    result = pd.DataFrame(retention_data)
+    
+    # Pivot for easier reading
+    if len(result) > 0:
+        pivot = result.pivot(
+            index='cohort_date',
+            columns='day',
+            values='retention_rate'
+        ).reset_index()
+        
+        pivot.columns = ['cohort_date'] + [f'Day_{int(col)}' for col in pivot.columns[1:]]
+        return pivot
+    
+    return result
+
+
+def _create_retention_report(
+    retention_df: pd.DataFrame,
+    df: pd.DataFrame,
+    user_column: str,
+    method: str,
+    start_time: datetime,
+    round_decimals: int
+) -> Dict[str, Any]:
+    """Create comprehensive retention report."""
+    numeric_cols = retention_df.select_dtypes(include=[np.number]).columns
+    
+    report = {
+        'method': method,
+        'retention_data': retention_df,
+        'total_users': int(df[user_column].nunique()),
+        'total_records': len(df),
+        'date_range': {
+            'start': df[df.columns[df.columns.get_loc(user_column) + 1]].min().strftime('%Y-%m-%d'),
+            'end': df[df.columns[df.columns.get_loc(user_column) + 1]].max().strftime('%Y-%m-%d')
+        },
+        'processing_time_seconds': round(
+            (datetime.now() - start_time).total_seconds(), 3
+        ),
+        'status': 'success'
+    }
+    
+    # Calculate summary statistics if numeric data exists
+    if len(numeric_cols) > 0:
+        retention_values = retention_df[numeric_cols].values.flatten()
+        retention_values = retention_values[~np.isnan(retention_values)]
+        
+        if len(retention_values) > 0:
+            report['average_retention'] = round(float(np.mean(retention_values)), round_decimals)
+            report['median_retention'] = round(float(np.median(retention_values)), round_decimals)
+            report['min_retention'] = round(float(np.min(retention_values)), round_decimals)
+            report['max_retention'] = round(float(np.max(retention_values)), round_decimals)
+            report['std_retention'] = round(float(np.std(retention_values)), round_decimals)
+    
+    if 'cohort_period' in retention_df.columns or 'cohort_date' in retention_df.columns:
+        report['cohort_count'] = len(retention_df)
+    
+    return report
+
+
 if __name__ == "__main__":
     """
     Example usage and testing of the KPI calculations module.
@@ -765,6 +1360,87 @@ if __name__ == "__main__":
     
     arpu = calculate_arpu(df, revenue_column='value')
     print(f"\nAverage Revenue Per Transaction: ${arpu:,.2f}")
+    
+    print("\n" + "="*70)
+    
+    # Example 5: Calculate Customer Retention
+    print("\nExample 5: Calculate Customer Retention")
+    print("-" * 70)
+    
+    # Create sample user activity data for retention analysis
+    user_data = {
+        'user_id': [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 6, 6, 7, 8, 8, 9, 10, 10, 10],
+        'activity_date': [
+            '2026-01-15', '2026-02-10', '2026-03-05',
+            '2026-01-20', '2026-02-15',
+            '2026-01-25', '2026-02-20', '2026-03-15',
+            '2026-02-05', '2026-03-10',
+            '2026-02-12',
+            '2026-02-18', '2026-03-12',
+            '2026-03-08',
+            '2026-03-15', '2026-04-01',
+            '2026-03-20',
+            '2026-03-25', '2026-04-05', '2026-05-01'
+        ],
+        'event': ['login'] * 20
+    }
+    df_users = pd.DataFrame(user_data)
+    df_users['activity_date'] = pd.to_datetime(df_users['activity_date'])
+    
+    print("\nSample User Activity Data:")
+    print(f"Total Users: {df_users['user_id'].nunique()}")
+    print(f"Date Range: {df_users['activity_date'].min().date()} to {df_users['activity_date'].max().date()}")
+    print(f"Total Activities: {len(df_users)}")
+    
+    # Calculate cohort-based retention
+    print("\n• Cohort-Based Retention Analysis:")
+    retention_cohort = calculate_retention(
+        df_users,
+        user_column='user_id',
+        date_column='activity_date',
+        cohort_period='M',
+        retention_periods=3,
+        method='cohort'
+    )
+    print(retention_cohort)
+    
+    # Calculate simple retention rate
+    print("\n• Simple Period-over-Period Retention:")
+    retention_simple = calculate_retention(
+        df_users,
+        user_column='user_id',
+        date_column='activity_date',
+        cohort_period='M',
+        method='simple'
+    )
+    print(retention_simple)
+    
+    # Get overall retention rate
+    print("\n• Overall Retention Rate:")
+    retention_rate = calculate_retention(
+        df_users,
+        user_column='user_id',
+        date_column='activity_date',
+        method='cohort',
+        return_format='rate'
+    )
+    print(f"Average Retention Rate: {retention_rate}%")
+    
+    # Get detailed retention report
+    print("\n• Detailed Retention Report:")
+    retention_report = calculate_retention(
+        df_users,
+        user_column='user_id',
+        date_column='activity_date',
+        method='cohort',
+        return_format='dict'
+    )
+    print(f"Total Users: {retention_report['total_users']}")
+    print(f"Cohorts Analyzed: {retention_report['cohort_count']}")
+    if 'average_retention' in retention_report:
+        print(f"Average Retention: {retention_report['average_retention']}%")
+        print(f"Min Retention: {retention_report['min_retention']}%")
+        print(f"Max Retention: {retention_report['max_retention']}%")
     
     print("\n" + "="*70)
     print("\n✓ All KPI calculations completed successfully!")
