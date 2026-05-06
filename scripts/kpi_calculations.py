@@ -686,6 +686,375 @@ def calculate_conversion_rate(
     return round(float(conversion_rate), round_decimals)
 
 
+def calculate_product_performance(
+    df: pd.DataFrame,
+    product_column: str = 'product',
+    metrics: Optional[List[str]] = None,
+    revenue_column: Optional[str] = 'revenue',
+    quantity_column: Optional[str] = 'quantity',
+    date_column: Optional[str] = None,
+    category_column: Optional[str] = None,
+    cost_column: Optional[str] = None,
+    return_column: Optional[str] = None,
+    period: Optional[Union[str, AggregationPeriod]] = None,
+    top_n: Optional[int] = None,
+    include_trends: bool = False,
+    include_rankings: bool = True,
+    round_decimals: int = 2,
+    validate_data: bool = True
+) -> Union[pd.DataFrame, Dict[str, Any]]:
+    """
+    Calculate comprehensive product performance metrics for business analytics.
+    
+    This function provides multi-dimensional product performance analysis including:
+    - Revenue and sales volume metrics
+    - Profit margins and ROI
+    - Growth rates and trends
+    - Market share and rankings
+    - Return rates and quality metrics
+    - Time-based performance patterns
+    
+    Args:
+        df: Input DataFrame with product sales/transaction data
+        product_column: Name of column containing product identifiers
+        metrics: List of specific metrics to calculate. If None, calculates all available.
+            Options: ['revenue', 'quantity', 'profit', 'margin', 'roi', 'growth', 
+                     'market_share', 'return_rate', 'avg_price', 'velocity']
+        revenue_column: Name of column containing revenue/sales values
+        quantity_column: Name of column containing quantity sold
+        date_column: Name of column containing transaction dates (for trend analysis)
+        category_column: Name of column containing product categories
+        cost_column: Name of column containing product costs (for profit calculations)
+        return_column: Name of column indicating returns (boolean or count)
+        period: Time period for trend analysis ('D', 'W', 'M', 'Q', 'Y')
+        top_n: Return only top N performing products (by revenue)
+        include_trends: Include time-based trend analysis
+        include_rankings: Include product rankings
+        round_decimals: Number of decimal places for rounding
+        validate_data: Perform data validation before calculation
+    
+    Returns:
+        - DataFrame: Product performance metrics with one row per product
+        - Dict: Comprehensive performance report when include_trends=True
+    
+    Raises:
+        KPICalculationError: If calculation fails or data validation fails
+        ValueError: If invalid parameters or missing required columns
+    
+    Examples:
+        >>> # Basic product performance
+        >>> performance = calculate_product_performance(
+        ...     df,
+        ...     product_column='product_name',
+        ...     revenue_column='sales'
+        ... )
+        >>> print(performance.head())
+        
+        >>> # Comprehensive analysis with profit and trends
+        >>> performance = calculate_product_performance(
+        ...     df,
+        ...     product_column='product_id',
+        ...     revenue_column='revenue',
+        ...     cost_column='cost',
+        ...     date_column='order_date',
+        ...     include_trends=True,
+        ...     top_n=10
+        ... )
+        >>> print(f"Top Product: {performance['product'][0]}")
+        >>> print(f"Revenue: ${performance['total_revenue'][0]:,.2f}")
+        
+        >>> # Category-level performance with returns
+        >>> performance = calculate_product_performance(
+        ...     df,
+        ...     product_column='product',
+        ...     category_column='category',
+        ...     return_column='is_returned',
+        ...     metrics=['revenue', 'quantity', 'return_rate']
+        ... )
+    """
+    start_time = datetime.now()
+    
+    # Input validation
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError("Input must be a pandas DataFrame")
+    
+    if df.empty:
+        logger.warning("Input DataFrame is empty")
+        return pd.DataFrame()
+    
+    # Check required columns
+    if product_column not in df.columns:
+        raise ValueError(
+            f"Product column '{product_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    
+    try:
+        logger.info(
+            f"Calculating product performance: {df[product_column].nunique()} products, "
+            f"{len(df)} transactions"
+        )
+        
+        # Work on a copy
+        df_work = df.copy()
+        
+        # Data validation
+        if validate_data:
+            _validate_product_data(df_work, product_column, revenue_column)
+        
+        # Initialize metrics dictionary
+        available_metrics = {
+            'revenue': revenue_column is not None,
+            'quantity': quantity_column is not None,
+            'profit': revenue_column is not None and cost_column is not None,
+            'margin': revenue_column is not None and cost_column is not None,
+            'roi': revenue_column is not None and cost_column is not None,
+            'return_rate': return_column is not None,
+            'avg_price': revenue_column is not None and quantity_column is not None,
+            'market_share': revenue_column is not None
+        }
+        
+        # If no specific metrics requested, use all available
+        if metrics is None:
+            metrics = [k for k, v in available_metrics.items() if v]
+        else:
+            # Validate requested metrics
+            invalid_metrics = []
+            for metric in metrics:
+                if metric not in available_metrics:
+                    invalid_metrics.append(metric)
+                elif not available_metrics[metric]:
+                    logger.warning(
+                        f"Metric '{metric}' requested but required columns not available"
+                    )
+        
+        # Start building aggregation dictionary
+        agg_dict = {}
+        
+        # Revenue metrics
+        if 'revenue' in metrics and revenue_column:
+            df_work[revenue_column] = pd.to_numeric(df_work[revenue_column], errors='coerce')
+            agg_dict[f'{revenue_column}_sum'] = (revenue_column, 'sum')
+            agg_dict[f'{revenue_column}_mean'] = (revenue_column, 'mean')
+            agg_dict[f'{revenue_column}_count'] = (revenue_column, 'count')
+        
+        # Quantity metrics
+        if 'quantity' in metrics and quantity_column:
+            df_work[quantity_column] = pd.to_numeric(df_work[quantity_column], errors='coerce')
+            agg_dict[f'{quantity_column}_sum'] = (quantity_column, 'sum')
+            agg_dict[f'{quantity_column}_mean'] = (quantity_column, 'mean')
+        
+        # Cost metrics (for profit calculations)
+        if cost_column and ('profit' in metrics or 'margin' in metrics or 'roi' in metrics):
+            df_work[cost_column] = pd.to_numeric(df_work[cost_column], errors='coerce')
+            agg_dict[f'{cost_column}_sum'] = (cost_column, 'sum')
+        
+        # Return metrics
+        if 'return_rate' in metrics and return_column:
+            if df_work[return_column].dtype == 'bool':
+                df_work[return_column] = df_work[return_column].astype(int)
+            agg_dict[f'{return_column}_sum'] = (return_column, 'sum')
+        
+        # Aggregate by product
+        if agg_dict:
+            result = df_work.groupby(product_column).agg(**agg_dict).reset_index()
+        else:
+            result = df_work.groupby(product_column).size().reset_index(name='count')
+        
+        # Rename columns for clarity
+        rename_map = {}
+        if revenue_column:
+            rename_map[f'{revenue_column}_sum'] = 'total_revenue'
+            rename_map[f'{revenue_column}_mean'] = 'avg_revenue'
+            rename_map[f'{revenue_column}_count'] = 'transaction_count'
+        if quantity_column:
+            rename_map[f'{quantity_column}_sum'] = 'total_quantity'
+            rename_map[f'{quantity_column}_mean'] = 'avg_quantity'
+        if cost_column:
+            rename_map[f'{cost_column}_sum'] = 'total_cost'
+        if return_column:
+            rename_map[f'{return_column}_sum'] = 'return_count'
+        
+        result = result.rename(columns=rename_map)
+        
+        # Calculate derived metrics
+        
+        # Profit
+        if 'profit' in metrics and 'total_revenue' in result.columns and 'total_cost' in result.columns:
+            result['total_profit'] = result['total_revenue'] - result['total_cost']
+        
+        # Profit Margin
+        if 'margin' in metrics and 'total_revenue' in result.columns and 'total_cost' in result.columns:
+            result['profit_margin'] = (
+                (result['total_revenue'] - result['total_cost']) / result['total_revenue'] * 100
+            ).fillna(0)
+        
+        # ROI
+        if 'roi' in metrics and 'total_revenue' in result.columns and 'total_cost' in result.columns:
+            result['roi'] = (
+                ((result['total_revenue'] - result['total_cost']) / result['total_cost']) * 100
+            ).replace([np.inf, -np.inf], 0).fillna(0)
+        
+        # Return Rate
+        if 'return_rate' in metrics and 'return_count' in result.columns:
+            result['return_rate'] = (
+                result['return_count'] / result['transaction_count'] * 100
+            ).fillna(0)
+        
+        # Average Price
+        if 'avg_price' in metrics and 'total_revenue' in result.columns and 'total_quantity' in result.columns:
+            result['avg_price'] = (result['total_revenue'] / result['total_quantity']).fillna(0)
+        
+        # Market Share
+        if 'market_share' in metrics and 'total_revenue' in result.columns:
+            total_market = result['total_revenue'].sum()
+            result['market_share'] = (result['total_revenue'] / total_market * 100).fillna(0)
+        
+        # Add category if provided
+        if category_column and category_column in df_work.columns:
+            category_map = df_work.groupby(product_column)[category_column].first()
+            result = result.merge(
+                category_map.reset_index(),
+                on=product_column,
+                how='left'
+            )
+        
+        # Add rankings
+        if include_rankings and 'total_revenue' in result.columns:
+            result['revenue_rank'] = result['total_revenue'].rank(ascending=False, method='dense').astype(int)
+            
+            if 'total_quantity' in result.columns:
+                result['quantity_rank'] = result['total_quantity'].rank(ascending=False, method='dense').astype(int)
+            
+            if 'total_profit' in result.columns:
+                result['profit_rank'] = result['total_profit'].rank(ascending=False, method='dense').astype(int)
+        
+        # Sort by revenue (descending)
+        if 'total_revenue' in result.columns:
+            result = result.sort_values('total_revenue', ascending=False)
+        
+        # Limit to top N
+        if top_n and top_n > 0:
+            result = result.head(top_n)
+        
+        # Round numeric columns
+        numeric_cols = result.select_dtypes(include=[np.number]).columns
+        numeric_cols = [col for col in numeric_cols if 'rank' not in col]
+        result[numeric_cols] = result[numeric_cols].round(round_decimals)
+        
+        # Reset index
+        result = result.reset_index(drop=True)
+        
+        # Add trend analysis if requested
+        if include_trends and date_column and date_column in df_work.columns:
+            trends = _calculate_product_trends(
+                df_work,
+                product_column,
+                revenue_column,
+                quantity_column,
+                date_column,
+                period,
+                round_decimals
+            )
+            
+            # Return comprehensive report
+            report = {
+                'performance_summary': result,
+                'trends': trends,
+                'total_products': len(result),
+                'total_revenue': float(result['total_revenue'].sum()) if 'total_revenue' in result.columns else 0,
+                'total_quantity': int(result['total_quantity'].sum()) if 'total_quantity' in result.columns else 0,
+                'processing_time_seconds': round(
+                    (datetime.now() - start_time).total_seconds(), 3
+                ),
+                'status': 'success'
+            }
+            
+            if 'total_profit' in result.columns:
+                report['total_profit'] = float(result['total_profit'].sum())
+            
+            return report
+        
+        logger.info(
+            f"Product performance calculated: {len(result)} products analyzed"
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Product performance calculation failed: {str(e)}", exc_info=True)
+        raise KPICalculationError(
+            f"Product performance calculation failed: {str(e)}"
+        ) from e
+
+
+def _validate_product_data(
+    df: pd.DataFrame,
+    product_column: str,
+    revenue_column: Optional[str]
+) -> None:
+    """Validate product data for quality."""
+    if df[product_column].isnull().all():
+        raise ValueError(f"Product column '{product_column}' contains only null values")
+    
+    if revenue_column and revenue_column in df.columns:
+        if df[revenue_column].isnull().all():
+            raise ValueError(f"Revenue column '{revenue_column}' contains only null values")
+
+
+def _calculate_product_trends(
+    df: pd.DataFrame,
+    product_column: str,
+    revenue_column: Optional[str],
+    quantity_column: Optional[str],
+    date_column: str,
+    period: Optional[Union[str, AggregationPeriod]],
+    round_decimals: int
+) -> pd.DataFrame:
+    """Calculate product performance trends over time."""
+    # Convert date column
+    df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
+    df = df.dropna(subset=[date_column])
+    
+    if len(df) == 0:
+        return pd.DataFrame()
+    
+    # Determine period
+    if period is None:
+        period = AggregationPeriod.MONTHLY
+    
+    period_str = period.value if isinstance(period, AggregationPeriod) else period
+    
+    # Create period column
+    df['period'] = df[date_column].dt.to_period(period_str)
+    
+    # Aggregate by product and period
+    agg_dict = {}
+    if revenue_column:
+        agg_dict['revenue'] = (revenue_column, 'sum')
+    if quantity_column:
+        agg_dict['quantity'] = (quantity_column, 'sum')
+    
+    if not agg_dict:
+        return pd.DataFrame()
+    
+    trends = df.groupby([product_column, 'period']).agg(**agg_dict).reset_index()
+    trends['period'] = trends['period'].astype(str)
+    
+    # Calculate growth rates per product
+    if revenue_column and 'revenue' in trends.columns:
+        trends['revenue_growth'] = trends.groupby(product_column)['revenue'].pct_change() * 100
+    
+    if quantity_column and 'quantity' in trends.columns:
+        trends['quantity_growth'] = trends.groupby(product_column)['quantity'].pct_change() * 100
+    
+    # Round values
+    numeric_cols = trends.select_dtypes(include=[np.number]).columns
+    trends[numeric_cols] = trends[numeric_cols].round(round_decimals)
+    
+    return trends
+
+
 def calculate_retention(
     df: pd.DataFrame,
     user_column: str = 'user_id',

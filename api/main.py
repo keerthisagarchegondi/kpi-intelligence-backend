@@ -8,6 +8,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
+from routes import router as api_router
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -16,14 +17,17 @@ app = FastAPI(
     description="Business KPI Intelligence & Reporting System API"
 )
 
-# Configure CORS
+# Configure CORS - Allow frontend connection
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.ALLOWED_ORIGINS,
+    allow_origins=["*"],  # In production, restrict to specific origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include API routes
+app.include_router(api_router)
 
 @app.get("/health")
 async def health_check():
