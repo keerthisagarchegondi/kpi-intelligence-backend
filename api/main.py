@@ -8,7 +8,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config
-from routes import router as api_router
+from api.routes import router as api_router
 
 # Initialize FastAPI app
 app = FastAPI(
