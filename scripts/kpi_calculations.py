@@ -1055,6 +1055,453 @@ def _calculate_product_trends(
     return trends
 
 
+def detect_anomalies(
+    df: pd.DataFrame,
+    value_column: str,
+    date_column: Optional[str] = None,
+    method: str = 'zscore',
+    threshold: float = 3.0,
+    window_size: int = 7,
+    seasonal_period: Optional[int] = None,
+    groupby_column: Optional[str] = None,
+    return_scores: bool = False,
+    include_boundaries: bool = True,
+    handle_missing: str = 'interpolate',
+    round_decimals: int = 4
+) -> Union[pd.DataFrame, Dict[str, Any]]:
+    """
+    Detect anomalies in time series or numerical data using multiple statistical methods.
+    
+    This production-level function provides comprehensive anomaly detection including:
+    - Z-score (standard deviation) method
+    - Interquartile Range (IQR) method
+    - Modified Z-score (MAD - Median Absolute Deviation)
+    - Isolation Forest (machine learning)
+    - Moving average with standard deviation
+    - Seasonal decomposition (for time series)
+    
+    Args:
+        df: Input DataFrame with data to analyze
+        value_column: Name of column containing values to check for anomalies
+        date_column: Name of date column (required for time-series methods)
+        method: Anomaly detection method:
+            - 'zscore': Standard Z-score method (default)
+            - 'iqr': Interquartile Range method
+            - 'mad': Modified Z-score using Median Absolute Deviation
+            - 'isolation': Isolation Forest (ML-based)
+            - 'moving_avg': Moving average with confidence intervals
+            - 'seasonal': Seasonal decomposition residuals
+        threshold: Sensitivity threshold for anomaly detection:
+            - zscore/mad: Number of standard deviations (default: 3.0)
+            - iqr: Multiplier for IQR (default: 1.5)
+            - isolation: Contamination factor (0.0-0.5, default: 0.1)
+        window_size: Window size for moving average (default: 7)
+        seasonal_period: Period for seasonal decomposition (e.g., 7 for weekly, 30 for monthly)
+        groupby_column: Column to group by for separate anomaly detection per group
+        return_scores: Return anomaly scores along with binary flags
+        include_boundaries: Include upper and lower bounds in results
+        handle_missing: How to handle missing values: 'interpolate', 'drop', 'fill_mean', 'fill_median'
+        round_decimals: Decimal places for rounding scores
+    
+    Returns:
+        DataFrame with original data plus:
+            - 'is_anomaly': Boolean flag indicating anomalies
+            - 'anomaly_score': Anomaly score (if return_scores=True)
+            - 'upper_bound': Upper boundary (if include_boundaries=True)
+            - 'lower_bound': Lower boundary (if include_boundaries=True)
+        
+        Or Dict with:
+            - 'data': DataFrame with anomaly flags
+            - 'summary': Statistics about detected anomalies
+            - 'anomalies': List of detected anomaly records
+    
+    Raises:
+        KPICalculationError: If detection fails or data validation fails
+        ValueError: If invalid parameters or missing required columns
+    
+    Examples:
+        >>> # Basic Z-score anomaly detection
+        >>> result = detect_anomalies(
+        ...     df,
+        ...     value_column='revenue',
+        ...     method='zscore',
+        ...     threshold=3.0
+        ... )
+        >>> print(f"Anomalies detected: {result['is_anomaly'].sum()}")
+        
+        >>> # IQR method with detailed results
+        >>> result = detect_anomalies(
+        ...     df,
+        ...     value_column='sales',
+        ...     date_column='date',
+        ...     method='iqr',
+        ...     threshold=1.5,
+        ...     return_scores=True
+        ... )
+        
+        >>> # Moving average for time series
+        >>> result = detect_anomalies(
+        ...     df,
+        ...     value_column='daily_transactions',
+        ...     date_column='transaction_date',
+        ...     method='moving_avg',
+        ...     window_size=7
+        ... )
+        
+        >>> # Group-wise anomaly detection
+        >>> result = detect_anomalies(
+        ...     df,
+        ...     value_column='revenue',
+        ...     groupby_column='product_category',
+        ...     method='zscore'
+        ... )
+    """
+    start_time = datetime.now()
+    
+    # Input validation
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError("Input must be a pandas DataFrame")
+    
+    if df.empty:
+        logger.warning("Input DataFrame is empty")
+        return df
+    
+    if value_column not in df.columns:
+        raise ValueError(
+            f"Value column '{value_column}' not found. "
+            f"Available columns: {list(df.columns)}"
+        )
+    
+    # Validate method
+    valid_methods = ['zscore', 'iqr', 'mad', 'isolation', 'moving_avg', 'seasonal']
+    if method not in valid_methods:
+        raise ValueError(
+            f"Invalid method: {method}. Valid options: {valid_methods}"
+        )
+    
+    # Time series methods require date column
+    if method in ['moving_avg', 'seasonal'] and date_column is None:
+        raise ValueError(f"Method '{method}' requires date_column parameter")
+    
+    try:
+        logger.info(
+            f"Detecting anomalies: method={method}, column={value_column}, "
+            f"records={len(df)}"
+        )
+        
+        # Work on a copy
+        df_work = df.copy()
+        
+        # Convert value column to numeric
+        df_work[value_column] = pd.to_numeric(df_work[value_column], errors='coerce')
+        
+        # Handle missing values
+        original_count = len(df_work)
+        df_work = _handle_missing_values(df_work, value_column, handle_missing)
+        missing_handled = original_count - len(df_work)
+        
+        if missing_handled > 0:
+            logger.info(f"Handled {missing_handled} missing values using '{handle_missing}'")
+        
+        if len(df_work) == 0:
+            logger.warning("No valid data after handling missing values")
+            return df_work
+        
+        # Sort by date if provided
+        if date_column and date_column in df_work.columns:
+            df_work[date_column] = pd.to_datetime(df_work[date_column], errors='coerce')
+            df_work = df_work.sort_values(date_column)
+        
+        # Apply anomaly detection
+        if groupby_column and groupby_column in df_work.columns:
+            # Group-wise anomaly detection
+            results = []
+            for group_name, group_df in df_work.groupby(groupby_column):
+                group_result = _detect_anomalies_single(
+                    group_df,
+                    value_column,
+                    date_column,
+                    method,
+                    threshold,
+                    window_size,
+                    seasonal_period,
+                    return_scores,
+                    include_boundaries,
+                    round_decimals
+                )
+                results.append(group_result)
+            df_result = pd.concat(results, ignore_index=True)
+        else:
+            # Single group anomaly detection
+            df_result = _detect_anomalies_single(
+                df_work,
+                value_column,
+                date_column,
+                method,
+                threshold,
+                window_size,
+                seasonal_period,
+                return_scores,
+                include_boundaries,
+                round_decimals
+            )
+        
+        # Calculate summary statistics
+        total_anomalies = int(df_result['is_anomaly'].sum())
+        anomaly_rate = (total_anomalies / len(df_result)) * 100
+        
+        logger.info(
+            f"Anomaly detection completed: {total_anomalies} anomalies found "
+            f"({anomaly_rate:.2f}% of data)"
+        )
+        
+        # Return enhanced results if requested
+        if return_scores or total_anomalies > 0:
+            anomaly_records = df_result[df_result['is_anomaly']].to_dict(orient='records')
+            
+            summary = {
+                'method': method,
+                'total_records': len(df_result),
+                'total_anomalies': total_anomalies,
+                'anomaly_rate': round(anomaly_rate, 2),
+                'threshold': threshold,
+                'processing_time_seconds': round(
+                    (datetime.now() - start_time).total_seconds(), 3
+                )
+            }
+            
+            if 'anomaly_score' in df_result.columns:
+                scores = df_result['anomaly_score'].dropna()
+                if len(scores) > 0:
+                    summary['score_stats'] = {
+                        'min': round(float(scores.min()), round_decimals),
+                        'max': round(float(scores.max()), round_decimals),
+                        'mean': round(float(scores.mean()), round_decimals),
+                        'median': round(float(scores.median()), round_decimals)
+                    }
+            
+            return {
+                'data': df_result,
+                'summary': summary,
+                'anomalies': anomaly_records
+            }
+        
+        return df_result
+        
+    except Exception as e:
+        logger.error(f"Anomaly detection failed: {str(e)}", exc_info=True)
+        raise KPICalculationError(
+            f"Anomaly detection failed: {str(e)}"
+        ) from e
+
+
+def _handle_missing_values(
+    df: pd.DataFrame,
+    value_column: str,
+    method: str
+) -> pd.DataFrame:
+    """Handle missing values in data."""
+    if method == 'drop':
+        return df.dropna(subset=[value_column])
+    elif method == 'interpolate':
+        df[value_column] = df[value_column].interpolate(method='linear')
+        return df.dropna(subset=[value_column])
+    elif method == 'fill_mean':
+        df[value_column] = df[value_column].fillna(df[value_column].mean())
+        return df
+    elif method == 'fill_median':
+        df[value_column] = df[value_column].fillna(df[value_column].median())
+        return df
+    else:
+        return df.dropna(subset=[value_column])
+
+
+def _detect_anomalies_single(
+    df: pd.DataFrame,
+    value_column: str,
+    date_column: Optional[str],
+    method: str,
+    threshold: float,
+    window_size: int,
+    seasonal_period: Optional[int],
+    return_scores: bool,
+    include_boundaries: bool,
+    round_decimals: int
+) -> pd.DataFrame:
+    """Apply anomaly detection to a single group of data."""
+    
+    values = df[value_column].values
+    
+    if method == 'zscore':
+        # Z-score method
+        mean = np.mean(values)
+        std = np.std(values)
+        
+        if std == 0:
+            df['is_anomaly'] = False
+            if return_scores:
+                df['anomaly_score'] = 0.0
+            return df
+        
+        z_scores = np.abs((values - mean) / std)
+        df['is_anomaly'] = z_scores > threshold
+        
+        if return_scores:
+            df['anomaly_score'] = z_scores.round(round_decimals)
+        
+        if include_boundaries:
+            df['upper_bound'] = mean + (threshold * std)
+            df['lower_bound'] = mean - (threshold * std)
+    
+    elif method == 'iqr':
+        # Interquartile Range method
+        q1 = np.percentile(values, 25)
+        q3 = np.percentile(values, 75)
+        iqr = q3 - q1
+        
+        lower_bound = q1 - (threshold * iqr)
+        upper_bound = q3 + (threshold * iqr)
+        
+        df['is_anomaly'] = (values < lower_bound) | (values > upper_bound)
+        
+        if return_scores:
+            # Distance from nearest boundary
+            dist_lower = np.abs(values - lower_bound)
+            dist_upper = np.abs(values - upper_bound)
+            df['anomaly_score'] = np.minimum(dist_lower, dist_upper).round(round_decimals)
+        
+        if include_boundaries:
+            df['upper_bound'] = upper_bound
+            df['lower_bound'] = lower_bound
+    
+    elif method == 'mad':
+        # Modified Z-score using Median Absolute Deviation
+        median = np.median(values)
+        mad = np.median(np.abs(values - median))
+        
+        if mad == 0:
+            df['is_anomaly'] = False
+            if return_scores:
+                df['anomaly_score'] = 0.0
+            return df
+        
+        modified_z_scores = 0.6745 * (values - median) / mad
+        df['is_anomaly'] = np.abs(modified_z_scores) > threshold
+        
+        if return_scores:
+            df['anomaly_score'] = np.abs(modified_z_scores).round(round_decimals)
+        
+        if include_boundaries:
+            df['upper_bound'] = median + (threshold * mad / 0.6745)
+            df['lower_bound'] = median - (threshold * mad / 0.6745)
+    
+    elif method == 'isolation':
+        # Isolation Forest (requires sklearn)
+        try:
+            from sklearn.ensemble import IsolationForest
+            
+            # Use threshold as contamination parameter (convert to 0-0.5 range)
+            contamination = min(max(threshold / 10, 0.01), 0.5)
+            
+            iso_forest = IsolationForest(
+                contamination=contamination,
+                random_state=42,
+                n_estimators=100
+            )
+            
+            # Reshape for sklearn
+            X = values.reshape(-1, 1)
+            predictions = iso_forest.fit_predict(X)
+            scores = iso_forest.score_samples(X)
+            
+            df['is_anomaly'] = predictions == -1
+            
+            if return_scores:
+                # Convert to positive scores (higher = more anomalous)
+                df['anomaly_score'] = (-scores).round(round_decimals)
+        
+        except ImportError:
+            logger.warning("sklearn not installed, falling back to Z-score method")
+            return _detect_anomalies_single(
+                df, value_column, date_column, 'zscore',
+                3.0, window_size, seasonal_period, return_scores,
+                include_boundaries, round_decimals
+            )
+    
+    elif method == 'moving_avg':
+        # Moving average with confidence intervals
+        if len(df) < window_size:
+            logger.warning(f"Not enough data points for window size {window_size}")
+            df['is_anomaly'] = False
+            return df
+        
+        rolling_mean = df[value_column].rolling(window=window_size, center=True).mean()
+        rolling_std = df[value_column].rolling(window=window_size, center=True).std()
+        
+        upper_bound = rolling_mean + (threshold * rolling_std)
+        lower_bound = rolling_mean - (threshold * rolling_std)
+        
+        df['is_anomaly'] = (values < lower_bound) | (values > upper_bound)
+        
+        if return_scores:
+            # Distance from moving average in std units
+            df['anomaly_score'] = (
+                np.abs(values - rolling_mean) / rolling_std
+            ).round(round_decimals)
+        
+        if include_boundaries:
+            df['upper_bound'] = upper_bound
+            df['lower_bound'] = lower_bound
+    
+    elif method == 'seasonal':
+        # Seasonal decomposition
+        if seasonal_period is None:
+            seasonal_period = 7  # Default to weekly
+        
+        if len(df) < seasonal_period * 2:
+            logger.warning(
+                f"Not enough data for seasonal decomposition "
+                f"(need at least {seasonal_period * 2} points)"
+            )
+            df['is_anomaly'] = False
+            return df
+        
+        try:
+            from statsmodels.tsa.seasonal import seasonal_decompose
+            
+            # Perform seasonal decomposition
+            decomposition = seasonal_decompose(
+                df[value_column].fillna(method='ffill'),
+                model='additive',
+                period=seasonal_period
+            )
+            
+            residuals = decomposition.resid.dropna()
+            
+            # Detect anomalies in residuals using Z-score
+            mean_resid = np.mean(residuals)
+            std_resid = np.std(residuals)
+            
+            if std_resid > 0:
+                z_scores = np.abs((residuals - mean_resid) / std_resid)
+                df.loc[residuals.index, 'is_anomaly'] = z_scores > threshold
+                
+                if return_scores:
+                    df.loc[residuals.index, 'anomaly_score'] = z_scores.round(round_decimals)
+            else:
+                df['is_anomaly'] = False
+        
+        except ImportError:
+            logger.warning("statsmodels not installed, falling back to moving average")
+            return _detect_anomalies_single(
+                df, value_column, date_column, 'moving_avg',
+                threshold, window_size, seasonal_period, return_scores,
+                include_boundaries, round_decimals
+            )
+    
+    return df
+
+
 def calculate_retention(
     df: pd.DataFrame,
     user_column: str = 'user_id',
