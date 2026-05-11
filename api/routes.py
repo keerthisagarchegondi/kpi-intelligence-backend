@@ -2,13 +2,16 @@
 API Routes for KPI Intelligence Backend
 
 Production-level endpoints for serving processed business data
-to the frontend dashboard with proper error handling and validation.
+to the frontend dashboard with comprehensive error handling, logging,
+validation, and monitoring.
 """
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form, Request, status
 from fastapi.responses import JSONResponse
-from typing import Optional, Dict, List, Any
+from fastapi.exceptions import RequestValidationError
+from typing import Optional, Dict, List, Any, Callable
 from datetime import datetime, timedelta
+from functools import wraps
 import pandas as pd
 import numpy as np
 import os
@@ -17,10 +20,76 @@ import shutil
 import io
 from pathlib import Path
 import logging
+import logging.handlers
+import sys
+import time
+import traceback
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ============================================
+# PRODUCTION LOGGING CONFIGURATION
+# ============================================
+
+def setup_api_logger() -> logging.Logger:
+    """Configure production-level logger for API routes."""
+    logger = logging.getLogger(__name__)
+    
+    if logger.handlers:
+        return logger
+    
+    log_level = getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(), logging.INFO)
+    logger.setLevel(log_level)
+    
+    # Create logs directory
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Formatters
+    detailed_formatter = logging.Formatter(
+        fmt='%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    console_formatter = logging.Formatter(
+        fmt='%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # File handler for all API logs
+    api_handler = logging.handlers.RotatingFileHandler(
+        filename=log_dir / 'api.log',
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    api_handler.setLevel(logging.DEBUG)
+    api_handler.setFormatter(detailed_formatter)
+    
+    # Error-only handler
+    error_handler = logging.handlers.RotatingFileHandler(
+        filename=log_dir / 'api_errors.log',
+        maxBytes=10 * 1024 * 1024,
+        backupCount=10,
+        encoding='utf-8'
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(detailed_formatter)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(console_formatter)
+    
+    logger.addHandler(api_handler)
+    logger.addHandler(error_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+logger = setup_api_logger()
+logger.info("=" * 80)
+logger.info("API Routes module initialized with production logging")
+logger.info("=" * 80)
 
 # Initialize router
 router = APIRouter(prefix="/api/v1", tags=["analytics"])
@@ -29,6 +98,185 @@ router = APIRouter(prefix="/api/v1", tags=["analytics"])
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data" / "processed"
 
+# ============================================
+# ERROR HANDLING UTILITIES
+# ============================================
+
+class APIError(Exception):
+    """Custom API error with structured information."""
+    def __init__(self, message: str, status_code: int = 500, details: Dict = None):
+        self.message = message
+        self.status_code = status_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+
+def create_error_response(
+    error: Exception,
+    status_code: int = 500,
+    endpoint: str = None,
+    request_id: str = None
+) -> Dict[str, Any]:
+    """
+    Create standardized error response.
+    
+    Args:
+        error: Exception that occurred
+        status_code: HTTP status code
+        endpoint: API endpoint where error occurred
+        request_id: Unique request identifier
+    
+    Returns:
+        Standardized error response dictionary
+    """
+    error_response = {
+        "status": "error",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            "code": status_code
+        },
+        "timestamp": datetime.utcnow().isoformat(),
+        "request_id": request_id or f"req_{int(time.time() * 1000)}"
+    }
+    
+    if endpoint:
+        error_response["endpoint"] = endpoint
+    
+    # Add details if it's our custom APIError
+    if isinstance(error, APIError) and error.details:
+        error_response["error"]["details"] = error.details
+    
+    return error_response
+
+
+def log_request(endpoint: str, **kwargs):
+    """Log incoming API request with parameters."""
+    masked_params = {}
+    sensitive_keys = {'password', 'token', 'api_key', 'secret', 'auth'}
+    
+    for key, value in kwargs.items():
+        if any(sens in key.lower() for sens in sensitive_keys):
+            masked_params[key] = "***REDACTED***"
+        else:
+            masked_params[key] = value
+    
+    logger.info(f"→ REQUEST | {endpoint} | Params: {masked_params}")
+
+
+def log_response(endpoint: str, status_code: int, duration: float, **context):
+    """Log API response with performance metrics."""
+    log_level = logging.WARNING if status_code >= 400 else logging.INFO
+    
+    logger.log(
+        log_level,
+        f"← RESPONSE | {endpoint} | Status: {status_code} | Duration: {duration:.3f}s | {context}"
+    )
+
+
+def log_error(error: Exception, endpoint: str, **context):
+    """Log error with full context and stack trace."""
+    logger.error(
+        f"✗ ERROR | {endpoint} | {type(error).__name__}: {str(error)} | Context: {context}",
+        exc_info=True
+    )
+
+
+# ============================================
+# DECORATOR FOR ERROR HANDLING & MONITORING
+# ============================================
+
+def api_endpoint(func: Callable) -> Callable:
+    """
+    Decorator for API endpoints with comprehensive error handling and monitoring.
+    
+    Features:
+        - Request/response logging
+        - Performance monitoring
+        - Automatic error handling
+        - Structured error responses
+        - Exception tracking
+    
+    Usage:
+        @router.get("/endpoint")
+        @api_endpoint
+        async def my_endpoint():
+            # Your code here
+            pass
+    """
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        endpoint_name = func.__name__
+        start_time = time.time()
+        request_id = f"req_{int(time.time() * 1000)}"
+        
+        try:
+            # Log incoming request
+            log_request(endpoint_name, **kwargs)
+            
+            # Execute endpoint
+            result = await func(*args, **kwargs)
+            
+            # Calculate duration
+            duration = time.time() - start_time
+            
+            # Log response
+            log_response(endpoint_name, 200, duration, request_id=request_id)
+            
+            # Add metadata to response if it's a dict
+            if isinstance(result, dict):
+                if 'timestamp' not in result:
+                    result['timestamp'] = datetime.utcnow().isoformat()
+                result['request_id'] = request_id
+                result['processing_time'] = round(duration, 3)
+            
+            return result
+            
+        except HTTPException as http_exc:
+            # FastAPI HTTPException - pass through but log it
+            duration = time.time() - start_time
+            log_error(http_exc, endpoint_name, 
+                     status_code=http_exc.status_code,
+                     request_id=request_id)
+            log_response(endpoint_name, http_exc.status_code, duration, request_id=request_id)
+            raise
+            
+        except APIError as api_err:
+            # Custom API error
+            duration = time.time() - start_time
+            log_error(api_err, endpoint_name, 
+                     status_code=api_err.status_code,
+                     request_id=request_id)
+            log_response(endpoint_name, api_err.status_code, duration, request_id=request_id)
+            
+            error_response = create_error_response(
+                api_err, api_err.status_code, endpoint_name, request_id
+            )
+            raise HTTPException(
+                status_code=api_err.status_code,
+                detail=error_response
+            )
+            
+        except Exception as e:
+            # Unexpected error
+            duration = time.time() - start_time
+            log_error(e, endpoint_name, request_id=request_id)
+            log_response(endpoint_name, 500, duration, request_id=request_id)
+            
+            error_response = create_error_response(
+                e, 500, endpoint_name, request_id
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=error_response
+            )
+    
+    return wrapper
+
+
+# ============================================
+# DATA LOADING UTILITIES WITH ERROR HANDLING
+# ============================================
 
 def get_latest_file(pattern: str) -> Optional[Path]:
     """
@@ -39,64 +287,163 @@ def get_latest_file(pattern: str) -> Optional[Path]:
     
     Returns:
         Path to latest file or None if not found
+    
+    Raises:
+        APIError: If directory access fails
     """
     try:
-        files = list(DATA_DIR.glob(pattern))
-        if not files:
+        logger.debug(f"Searching for files matching pattern: {pattern}")
+        
+        if not DATA_DIR.exists():
+            logger.warning(f"Data directory does not exist: {DATA_DIR}")
             return None
+        
+        files = list(DATA_DIR.glob(pattern))
+        
+        if not files:
+            logger.warning(f"No files found matching pattern: {pattern}")
+            return None
+        
         # Sort by modification time, return latest
-        return max(files, key=lambda p: p.stat().st_mtime)
+        latest_file = max(files, key=lambda p: p.stat().st_mtime)
+        logger.debug(f"Latest file found: {latest_file.name}")
+        
+        return latest_file
+        
+    except PermissionError as e:
+        logger.error(f"Permission denied accessing data directory: {str(e)}")
+        raise APIError(
+            message="Insufficient permissions to access data files",
+            status_code=403,
+            details={"directory": str(DATA_DIR)}
+        )
     except Exception as e:
-        print(f"Error finding file with pattern {pattern}: {e}")
-        return None
+        logger.error(f"Error finding file with pattern {pattern}: {str(e)}", exc_info=True)
+        raise APIError(
+            message=f"Failed to search for data files: {str(e)}",
+            status_code=500,
+            details={"pattern": pattern}
+        )
 
 
 def load_csv_data(filename_pattern: str) -> Optional[pd.DataFrame]:
     """
-    Load CSV data from processed directory.
+    Load CSV data from processed directory with comprehensive error handling.
     
     Args:
         filename_pattern: Pattern to match CSV files
     
     Returns:
         DataFrame or None if file not found
+    
+    Raises:
+        APIError: If file loading fails
     """
     try:
+        logger.debug(f"Loading CSV data with pattern: {filename_pattern}")
+        
         file_path = get_latest_file(filename_pattern)
         if not file_path:
+            logger.warning(f"No CSV file found for pattern: {filename_pattern}")
             return None
-        return pd.read_csv(file_path)
+        
+        logger.info(f"Loading CSV file: {file_path.name}")
+        start_time = time.time()
+        
+        df = pd.read_csv(file_path)
+        
+        duration = time.time() - start_time
+        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        
+        logger.info(
+            f"✓ CSV loaded | File: {file_path.name} | "
+            f"Rows: {len(df):,} | Columns: {len(df.columns)} | "
+            f"Memory: {memory_mb:.2f} MB | Duration: {duration:.3f}s"
+        )
+        
+        return df
+        
+    except pd.errors.EmptyDataError:
+        logger.error(f"CSV file is empty: {filename_pattern}")
+        raise APIError(
+            message="Data file is empty",
+            status_code=404,
+            details={"pattern": filename_pattern}
+        )
+    except pd.errors.ParserError as e:
+        logger.error(f"CSV parsing error: {str(e)}", exc_info=True)
+        raise APIError(
+            message="Failed to parse CSV file - file may be corrupted",
+            status_code=500,
+            details={"pattern": filename_pattern, "error": str(e)}
+        )
     except Exception as e:
-        print(f"Error loading CSV data: {e}")
-        return None
+        logger.error(f"Error loading CSV data: {str(e)}", exc_info=True)
+        raise APIError(
+            message=f"Failed to load CSV data: {str(e)}",
+            status_code=500,
+            details={"pattern": filename_pattern}
+        )
 
 
 def load_parquet_data(filename_pattern: str) -> Optional[pd.DataFrame]:
     """
-    Load Parquet data from processed directory.
+    Load Parquet data from processed directory with comprehensive error handling.
     
     Args:
         filename_pattern: Pattern to match Parquet files
     
     Returns:
         DataFrame or None if file not found
+    
+    Raises:
+        APIError: If file loading fails
     """
     try:
+        logger.debug(f"Loading Parquet data with pattern: {filename_pattern}")
+        
         file_path = get_latest_file(filename_pattern)
         if not file_path:
+            logger.warning(f"No Parquet file found for pattern: {filename_pattern}")
             return None
-        return pd.read_parquet(file_path)
+        
+        logger.info(f"Loading Parquet file: {file_path.name}")
+        start_time = time.time()
+        
+        df = pd.read_parquet(file_path)
+        
+        duration = time.time() - start_time
+        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        
+        logger.info(
+            f"✓ Parquet loaded | File: {file_path.name} | "
+            f"Rows: {len(df):,} | Columns: {len(df.columns)} | "
+            f"Memory: {memory_mb:.2f} MB | Duration: {duration:.3f}s"
+        )
+        
+        return df
+        
     except Exception as e:
-        print(f"Error loading Parquet data: {e}")
-        return None
+        logger.error(f"Error loading Parquet data: {str(e)}", exc_info=True)
+        raise APIError(
+            message=f"Failed to load Parquet data: {str(e)}",
+            status_code=500,
+            details={"pattern": filename_pattern}
+        )
 
 
 @router.get("/health")
+@api_endpoint
 async def health_check():
-    """API health check endpoint"""
+    """
+    API health check endpoint with comprehensive system status.
+    
+    Returns system health, uptime, and available endpoints.
+    """
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "service": "KPI Intelligence Backend API",
+        "version": "1.0.0",
         "endpoints": [
             "/api/v1/products/performance",
             "/api/v1/products/kpi",
@@ -113,6 +460,7 @@ async def health_check():
 
 
 @router.get("/products/performance")
+@api_endpoint
 async def get_product_performance(
     limit: Optional[int] = Query(None, ge=1, le=100, description="Limit number of products returned"),
     category: Optional[str] = Query(None, description="Filter by product category"),
@@ -120,33 +468,86 @@ async def get_product_performance(
     sort_order: Optional[str] = Query("desc", description="Sort order: asc or desc")
 ):
     """
-    Get product performance metrics.
+    Get product performance metrics with comprehensive error handling and validation.
     
     Returns comprehensive product analytics including revenue, profit,
     quantity sold, and market share.
+    
+    Args:
+        limit: Maximum number of products to return (1-100)
+        category: Filter results by product category
+        sort_by: Field to sort by (default: total_revenue)
+        sort_order: Sort order - 'asc' or 'desc' (default: desc)
+    
+    Returns:
+        JSON response with product performance data
+    
+    Raises:
+        HTTPException 404: Product data not found
+        HTTPException 400: Invalid parameters
+        HTTPException 500: Server error
     """
     try:
+        # Validate sort_order
+        if sort_order not in ['asc', 'desc']:
+            raise APIError(
+                message="Invalid sort_order. Must be 'asc' or 'desc'",
+                status_code=400,
+                details={"provided": sort_order, "valid_options": ["asc", "desc"]}
+            )
+        
         # Load product performance data
         df = load_csv_data("product_performance_*.csv")
         
         if df is None:
-            raise HTTPException(
+            raise APIError(
+                message="Product performance data not found",
                 status_code=404,
-                detail="Product performance data not found"
+                details={
+                    "searched_pattern": "product_performance_*.csv",
+                    "data_directory": str(DATA_DIR)
+                }
             )
+        
+        logger.debug(f"Loaded product data: {len(df)} rows")
         
         # Filter by category if provided
         if category:
+            if 'category' not in df.columns:
+                raise APIError(
+                    message="Category column not found in data",
+                    status_code=400,
+                    details={"available_columns": list(df.columns)}
+                )
+            
+            original_count = len(df)
             df = df[df['category'] == category]
+            logger.debug(f"Filtered by category '{category}': {len(df)} rows (from {original_count})")
+            
+            if df.empty:
+                raise APIError(
+                    message=f"No products found for category: {category}",
+                    status_code=404,
+                    details={"category": category}
+                )
+        
+        # Validate sort_by column exists
+        if sort_by not in df.columns:
+            logger.warning(f"Sort column '{sort_by}' not found, using default")
+            if 'total_revenue' in df.columns:
+                sort_by = 'total_revenue'
+            else:
+                sort_by = df.columns[0]
         
         # Sort data
         ascending = sort_order.lower() == "asc"
-        if sort_by in df.columns:
-            df = df.sort_values(by=sort_by, ascending=ascending)
+        df = df.sort_values(by=sort_by, ascending=ascending)
+        logger.debug(f"Sorted by {sort_by} ({sort_order})")
         
         # Limit results
         if limit:
             df = df.head(limit)
+            logger.debug(f"Limited to {limit} results")
         
         # Convert to dict for JSON response
         result = df.to_dict(orient='records')
@@ -155,66 +556,116 @@ async def get_product_performance(
             "status": "success",
             "data": result,
             "count": len(result),
-            "timestamp": datetime.utcnow().isoformat()
+            "filters": {
+                "category": category,
+                "limit": limit,
+                "sort_by": sort_by,
+                "sort_order": sort_order
+            }
         }
     
-    except HTTPException:
+    except APIError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving product performance data: {str(e)}"
+        log_error(e, "get_product_performance")
+        raise APIError(
+            message=f"Error retrieving product performance data: {str(e)}",
+            status_code=500
         )
 
 
 @router.get("/products/kpi")
+@api_endpoint
 async def get_product_kpi():
     """
-    Get aggregated product KPI metrics for dashboard.
+    Get aggregated product KPI metrics for dashboard with comprehensive error handling.
     
     Returns:
         Summary KPIs including total revenue, average profit margin,
         top products, and category performance.
+    
+    Raises:
+        HTTPException 404: Product data not found
+        HTTPException 500: Server error during KPI calculation
     """
     try:
         # Load product performance data
         df = load_csv_data("product_performance_*.csv")
         
         if df is None:
-            raise HTTPException(
+            raise APIError(
+                message="Product performance data not found",
                 status_code=404,
-                detail="Product performance data not found"
+                details={"data_file": "product_performance_*.csv"}
             )
         
-        # Calculate KPIs
-        total_revenue = float(df['total_revenue'].sum())
-        total_profit = float(df['total_profit'].sum())
-        avg_profit_margin = float(df['profit_margin'].mean())
-        avg_roi = float(df['roi'].mean())
-        total_transactions = int(df['transaction_count'].sum())
-        total_quantity_sold = int(df['total_quantity'].sum())
-        avg_return_rate = float(df['return_rate'].mean())
+        logger.info(f"Calculating KPIs from {len(df)} products")
+        
+        # Validate required columns
+        required_cols = ['total_revenue', 'total_profit', 'profit_margin', 'roi', 
+                        'transaction_count', 'total_quantity', 'return_rate']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            logger.warning(f"Missing columns in data: {missing_cols}")
+            raise APIError(
+                message="Data file is missing required columns",
+                status_code=500,
+                details={
+                    "missing_columns": missing_cols,
+                    "available_columns": list(df.columns)
+                }
+            )
+        
+        # Calculate KPIs with error handling
+        try:
+            total_revenue = float(df['total_revenue'].sum())
+            total_profit = float(df['total_profit'].sum())
+            avg_profit_margin = float(df['profit_margin'].mean())
+            avg_roi = float(df['roi'].mean())
+            total_transactions = int(df['transaction_count'].sum())
+            total_quantity_sold = int(df['total_quantity'].sum())
+            avg_return_rate = float(df['return_rate'].mean())
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error calculating numeric KPIs: {str(e)}")
+            raise APIError(
+                message="Failed to calculate KPIs - invalid data types",
+                status_code=500,
+                details={"error": str(e)}
+            )
         
         # Top products
-        top_products_by_revenue = df.nlargest(5, 'total_revenue')[
-            ['product', 'total_revenue', 'profit_margin', 'market_share']
-        ].to_dict(orient='records')
-        
-        top_products_by_profit = df.nlargest(5, 'total_profit')[
-            ['product', 'total_profit', 'roi', 'profit_margin']
-        ].to_dict(orient='records')
+        try:
+            top_products_by_revenue = df.nlargest(5, 'total_revenue')[
+                ['product', 'total_revenue', 'profit_margin', 'market_share']
+            ].to_dict(orient='records')
+            
+            top_products_by_profit = df.nlargest(5, 'total_profit')[
+                ['product', 'total_profit', 'roi', 'profit_margin']
+            ].to_dict(orient='records')
+        except KeyError as e:
+            logger.error(f"Missing column for top products: {str(e)}")
+            top_products_by_revenue = []
+            top_products_by_profit = []
         
         # Category performance
-        category_summary = df.groupby('category').agg({
-            'total_revenue': 'sum',
-            'total_profit': 'sum',
-            'transaction_count': 'sum',
-            'total_quantity': 'sum'
-        }).reset_index().to_dict(orient='records')
+        category_summary = []
+        if 'category' in df.columns:
+            try:
+                category_summary = df.groupby('category').agg({
+                    'total_revenue': 'sum',
+                    'total_profit': 'sum',
+                    'transaction_count': 'sum',
+                    'total_quantity': 'sum'
+                }).reset_index().to_dict(orient='records')
+            except Exception as e:
+                logger.warning(f"Failed to calculate category summary: {str(e)}")
         
         # Calculate growth (comparing top products)
         revenue_growth = 15.3  # Placeholder - would calculate from historical data
         profit_growth = 12.7
+        
+        logger.info(f"✓ KPIs calculated | Revenue: ${total_revenue:,.2f} | Profit: ${total_profit:,.2f}")
         
         return {
             "status": "success",
@@ -235,37 +686,72 @@ async def get_product_kpi():
                     "by_profit": top_products_by_profit
                 },
                 "categories": category_summary
-            },
-            "timestamp": datetime.utcnow().isoformat()
+            }
         }
     
-    except HTTPException:
+    except APIError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error calculating product KPIs: {str(e)}"
+        log_error(e, "get_product_kpi")
+        raise APIError(
+            message=f"Error calculating product KPIs: {str(e)}",
+            status_code=500
         )
 
 
 @router.get("/sales/summary")
+@api_endpoint
 async def get_sales_summary(
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)")
 ):
     """
-    Get sales summary data.
+    Get sales summary data with comprehensive error handling.
     
     Returns aggregated sales metrics for the specified date range.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format (optional)
+        end_date: End date in YYYY-MM-DD format (optional)
+    
+    Returns:
+        JSON response with sales summary and daily trends
+    
+    Raises:
+        HTTPException 400: Invalid date format
+        HTTPException 404: Sales data not found
+        HTTPException 500: Server error
     """
     try:
+        # Validate date formats if provided
+        if start_date:
+            try:
+                datetime.strptime(start_date, '%Y-%m-%d')
+            except ValueError:
+                raise APIError(
+                    message="Invalid start_date format. Use YYYY-MM-DD",
+                    status_code=400,
+                    details={"provided": start_date, "expected_format": "YYYY-MM-DD"}
+                )
+        
+        if end_date:
+            try:
+                datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                raise APIError(
+                    message="Invalid end_date format. Use YYYY-MM-DD",
+                    status_code=400,
+                    details={"provided": end_date, "expected_format": "YYYY-MM-DD"}
+                )
+        
         # Load sales data
         df = load_parquet_data("sales_data_cleaned_*.parquet")
         
         if df is None:
-            raise HTTPException(
+            raise APIError(
+                message="Sales data not found",
                 status_code=404,
-                detail="Sales data not found"
+                details={"searched_pattern": "sales_data_cleaned_*.parquet"}
             )
         
         # Filter by date range if provided
@@ -289,6 +775,8 @@ async def get_sales_summary(
         else:
             daily_trend = []
         
+        logger.info(f"✓ Sales summary calculated | Total: ${total_sales:,.2f} | Transactions: {transaction_count:,}")
+        
         return {
             "status": "success",
             "data": {
@@ -297,30 +785,40 @@ async def get_sales_summary(
                     "transaction_count": transaction_count,
                     "avg_order_value": round(avg_order_value, 2)
                 },
-                "daily_trend": daily_trend
-            },
-            "timestamp": datetime.utcnow().isoformat()
+                "daily_trend": daily_trend,
+                "date_range": {
+                    "start": start_date,
+                    "end": end_date
+                }
+            }
         }
     
-    except HTTPException:
+    except APIError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving sales summary: {str(e)}"
+        log_error(e, "get_sales_summary")
+        raise APIError(
+            message=f"Error retrieving sales summary: {str(e)}",
+            status_code=500
         )
 
 
 @router.get("/dashboard/metrics")
+@api_endpoint
 async def get_dashboard_metrics():
     """
-    Get comprehensive dashboard metrics combining all data sources.
+    Get comprehensive dashboard metrics combining all data sources with error handling.
     
     Returns:
         Aggregated KPIs for dashboard display including revenue,
         customers, products, and operational metrics.
+    
+    Raises:
+        HTTPException 500: Server error during metrics calculation
     """
     try:
+        logger.info("Loading dashboard metrics from multiple data sources")
+        
         # Load all data sources
         product_df = load_csv_data("product_performance_*.csv")
         sales_df = load_parquet_data("sales_data_cleaned_*.parquet")
@@ -359,35 +857,65 @@ async def get_dashboard_metrics():
                 "nps_score": 62.4
             }
         
+        logger.info(f"✓ Dashboard metrics calculated | Sources: {len([k for k, v in metrics.items() if v])}")
+        
         return {
             "status": "success",
             "data": metrics,
-            "timestamp": datetime.utcnow().isoformat()
+            "data_sources": {
+                "product_data_available": product_df is not None,
+                "sales_data_available": sales_df is not None
+            }
         }
     
+    except APIError:
+        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving dashboard metrics: {str(e)}"
+        log_error(e, "get_dashboard_metrics")
+        raise APIError(
+            message=f"Error retrieving dashboard metrics: {str(e)}",
+            status_code=500
         )
 
 
 @router.get("/dashboard/revenue")
+@api_endpoint
 async def get_revenue_data(
     period: str = Query("30d", description="Time period: 7d, 30d, 90d, 12m")
 ):
     """
-    Get revenue data for specified time period.
+    Get revenue data for specified time period with comprehensive error handling.
     
     Returns time-series revenue data with costs and profit breakdown.
+    
+    Args:
+        period: Time period (7d, 30d, 90d, or 12m)
+    
+    Returns:
+        JSON response with time-series revenue data
+    
+    Raises:
+        HTTPException 400: Invalid period parameter
+        HTTPException 404: Revenue data not found
+        HTTPException 500: Server error
     """
     try:
+        # Validate period
+        valid_periods = ["7d", "30d", "90d", "12m"]
+        if period not in valid_periods:
+            raise APIError(
+                message=f"Invalid period. Must be one of: {', '.join(valid_periods)}",
+                status_code=400,
+                details={"provided": period, "valid_options": valid_periods}
+            )
+        
         product_df = load_csv_data("product_performance_*.csv")
         
         if product_df is None:
-            raise HTTPException(
+            raise APIError(
+                message="Revenue data not found",
                 status_code=404,
-                detail="Revenue data not found"
+                details={"searched_pattern": "product_performance_*.csv"}
             )
         
         # Generate time series data based on product performance
@@ -414,30 +942,44 @@ async def get_revenue_data(
                 "profit": round(daily_revenue * variance * 0.33, 2)
             })
         
+        logger.info(f"✓ Revenue data generated | Period: {period} | Data points: {len(revenue_data)}")
+        
         return {
             "status": "success",
             "data": revenue_data,
             "period": period,
-            "timestamp": datetime.utcnow().isoformat()
+            "period_days": days,
+            "total_revenue": round(sum(item['revenue'] for item in revenue_data), 2),
+            "total_profit": round(sum(item['profit'] for item in revenue_data), 2)
         }
     
-    except HTTPException:
+    except APIError:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving revenue data: {str(e)}"
+        log_error(e, "get_revenue_data")
+        raise APIError(
+            message=f"Error retrieving revenue data: {str(e)}",
+            status_code=500
         )
 
 
 @router.get("/dashboard/customers")
+@api_endpoint
 async def get_customer_data():
     """
-    Get customer segmentation and metrics.
+    Get customer segmentation and metrics with comprehensive error handling.
     
     Returns customer data by segment with revenue and churn metrics.
+    
+    Returns:
+        JSON response with customer segmentation data
+    
+    Raises:
+        HTTPException 500: Server error
     """
     try:
+        logger.info("Generating customer segmentation data")
+        
         # In production, this would come from CRM/customer database
         # For now, return structured data based on business logic
         
@@ -489,21 +1031,33 @@ async def get_customer_data():
             }
         ]
         
+        total_customers = sum(s["customers"] for s in segments)
+        total_revenue = sum(s["revenue"] for s in segments)
+        
+        logger.info(f"✓ Customer data generated | Total customers: {total_customers:,} | Segments: {len(segments)}")
+        
         return {
             "status": "success",
             "data": segments,
-            "total_customers": sum(s["customers"] for s in segments),
-            "timestamp": datetime.utcnow().isoformat()
+            "summary": {
+                "total_customers": total_customers,
+                "total_revenue": round(total_revenue, 2),
+                "segment_count": len(segments)
+            }
         }
     
+    except APIError:
+        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving customer data: {str(e)}"
+        log_error(e, "get_customer_data")
+        raise APIError(
+            message=f"Error retrieving customer data: {str(e)}",
+            status_code=500
         )
 
 
 @router.post("/upload")
+@api_endpoint
 async def upload_data_file(
     file: UploadFile = File(...),
     file_type: Optional[str] = Form(None),
@@ -513,7 +1067,7 @@ async def upload_data_file(
     validate_schema: bool = Form(True)
 ):
     """
-    Upload data file (CSV, Excel, Parquet, JSON) with validation and processing.
+    Upload data file (CSV, Excel, Parquet, JSON) with comprehensive validation and processing.
     
     This production-level endpoint provides:
     - Multiple file format support (CSV, XLSX, Parquet, JSON)
@@ -523,6 +1077,8 @@ async def upload_data_file(
     - Data quality checks
     - Storage to raw/processed directories
     - Detailed upload report
+    - Comprehensive error handling
+    - Security validations
     
     Args:
         file: File to upload (multipart/form-data)
@@ -559,47 +1115,61 @@ async def upload_data_file(
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
     ALLOWED_EXTENSIONS = {'.csv', '.xlsx', '.xls', '.parquet', '.json'}
     
+    start_time = datetime.now()
+    upload_id = f"upload_{int(time.time() * 1000)}"
+    
     try:
-        start_time = datetime.now()
+        logger.info(f"[{upload_id}] File upload initiated | Filename: {file.filename if file else 'None'}")
         
         # Validate file exists
-        if not file:
-            raise HTTPException(
+        if not file or not file.filename:
+            raise APIError(
+                message="No file provided",
                 status_code=400,
-                detail="No file provided"
+                details={"upload_id": upload_id}
             )
         
         # Get file extension
         file_ext = Path(file.filename).suffix.lower()
+        logger.debug(f"[{upload_id}] File extension: {file_ext}")
         
         # Validate file extension
         if file_ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(
+            raise APIError(
+                message=f"Invalid file format. Allowed formats: {', '.join(ALLOWED_EXTENSIONS)}",
                 status_code=400,
-                detail=f"Invalid file format. Allowed formats: {', '.join(ALLOWED_EXTENSIONS)}"
+                details={
+                    "provided_extension": file_ext,
+                    "allowed_extensions": list(ALLOWED_EXTENSIONS),
+                    "upload_id": upload_id
+                }
             )
         
         # Read file content
+        logger.debug(f"[{upload_id}] Reading file content...")
         contents = await file.read()
         file_size = len(contents)
         
+        logger.info(f"[{upload_id}] File read complete | Size: {file_size / 1024:.2f} KB")
+        
         # Validate file size
         if file_size > MAX_FILE_SIZE:
-            raise HTTPException(
+            raise APIError(
+                message=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.0f} MB",
                 status_code=413,
-                detail=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.0f} MB"
+                details={
+                    "file_size_mb": round(file_size / (1024 * 1024), 2),
+                    "max_size_mb": MAX_FILE_SIZE / (1024 * 1024),
+                    "upload_id": upload_id
+                }
             )
         
         if file_size == 0:
-            raise HTTPException(
+            raise APIError(
+                message="Empty file uploaded",
                 status_code=400,
-                detail="Empty file uploaded"
+                details={"upload_id": upload_id}
             )
-        
-        logger.info(
-            f"File upload started: {file.filename} "
-            f"(size: {file_size / 1024:.2f} KB, format: {file_ext})"
-        )
         
         # Determine file type
         if file_type is None:
@@ -612,8 +1182,13 @@ async def upload_data_file(
             }
             file_type = file_type_map.get(file_ext, 'csv')
         
+        logger.info(f"[{upload_id}] File type: {file_type}")
+        
         # Parse file content based on type
         try:
+            logger.info(f"[{upload_id}] Parsing file content...")
+            parse_start = time.time()
+            
             if file_type == 'csv':
                 df = pd.read_csv(io.BytesIO(contents))
             elif file_type == 'excel':
@@ -623,12 +1198,38 @@ async def upload_data_file(
             elif file_type == 'json':
                 df = pd.read_json(io.BytesIO(contents))
             else:
-                raise ValueError(f"Unsupported file type: {file_type}")
+                raise APIError(
+                    message=f"Unsupported file type: {file_type}",
+                    status_code=400,
+                    details={"upload_id": upload_id}
+                )
+            
+            parse_duration = time.time() - parse_start
+            logger.info(
+                f"[{upload_id}] ✓ File parsed | "
+                f"Rows: {len(df):,} | Columns: {len(df.columns)} | "
+                f"Duration: {parse_duration:.3f}s"
+            )
         
-        except Exception as e:
-            raise HTTPException(
+        except pd.errors.EmptyDataError:
+            raise APIError(
+                message="File contains no data",
                 status_code=400,
-                detail=f"Failed to parse file: {str(e)}"
+                details={"upload_id": upload_id}
+            )
+        except pd.errors.ParserError as e:
+            logger.error(f"[{upload_id}] Parsing error: {str(e)}")
+            raise APIError(
+                message=f"Failed to parse file: {str(e)}",
+                status_code=400,
+                details={"upload_id": upload_id, "parse_error": str(e)}
+            )
+        except Exception as e:
+            logger.error(f"[{upload_id}] File parsing failed: {str(e)}", exc_info=True)
+            raise APIError(
+                message=f"Failed to parse file: {str(e)}",
+                status_code=400,
+                details={"upload_id": upload_id}
             )
         
         # Basic file information
@@ -643,24 +1244,40 @@ async def upload_data_file(
             'upload_timestamp': datetime.utcnow().isoformat()
         }
         
-        logger.info(f"File parsed: {file_info['rows']} rows, {file_info['columns']} columns")
+        logger.info(f"[{upload_id}] File info: {file_info['rows']:,} rows, {file_info['columns']} columns")
         
         # Data validation
         validation_results = {}
         if validate_schema:
-            validation_results = _validate_uploaded_data(df)
-            
-            # Check for critical validation errors
-            if validation_results.get('has_errors', False):
-                logger.warning(f"Validation errors found: {validation_results['errors']}")
+            logger.info(f"[{upload_id}] Validating data schema...")
+            try:
+                validation_results = _validate_uploaded_data(df)
+                
+                # Check for critical validation errors
+                if validation_results.get('has_errors', False):
+                    logger.warning(
+                        f"[{upload_id}] Validation errors found: {validation_results['errors']}"
+                    )
+            except Exception as e:
+                logger.error(f"[{upload_id}] Validation failed: {str(e)}", exc_info=True)
+                validation_results = {
+                    'error': f"Validation failed: {str(e)}"
+                }
         
         # Data processing
         processing_summary = {}
         df_processed = df.copy()
         
         if process_data:
-            processing_summary = _process_uploaded_data(df_processed)
-            logger.info(f"Data processing completed: {processing_summary}")
+            logger.info(f"[{upload_id}] Processing uploaded data...")
+            try:
+                processing_summary = _process_uploaded_data(df_processed)
+                logger.info(f"[{upload_id}] ✓ Processing complete: {processing_summary}")
+            except Exception as e:
+                logger.error(f"[{upload_id}] Processing failed: {str(e)}", exc_info=True)
+                processing_summary = {
+                    'error': f"Processing failed: {str(e)}"
+                }
         
         # Save files
         saved_paths = {}
@@ -669,51 +1286,62 @@ async def upload_data_file(
         
         # Save to raw directory
         if save_to_raw:
-            raw_dir = BASE_DIR / "data" / "raw"
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            
-            raw_filename = f"{base_filename}_{timestamp_str}{file_ext}"
-            raw_path = raw_dir / raw_filename
-            
-            # Save original file
-            with open(raw_path, 'wb') as f:
-                f.write(contents)
-            
-            saved_paths['raw'] = str(raw_path)
-            logger.info(f"Saved to raw: {raw_filename}")
+            try:
+                logger.info(f"[{upload_id}] Saving to raw directory...")
+                raw_dir = BASE_DIR / "data" / "raw"
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                
+                raw_filename = f"{base_filename}_{timestamp_str}{file_ext}"
+                raw_path = raw_dir / raw_filename
+                
+                # Save original file
+                with open(raw_path, 'wb') as f:
+                    f.write(contents)
+                
+                saved_paths['raw'] = str(raw_path)
+                logger.info(f"[{upload_id}] ✓ Saved to raw: {raw_filename}")
+            except Exception as e:
+                logger.error(f"[{upload_id}] Failed to save to raw: {str(e)}", exc_info=True)
+                saved_paths['raw_error'] = str(e)
         
         # Save to processed directory
         if save_to_processed and process_data:
-            processed_dir = BASE_DIR / "data" / "processed"
-            processed_dir.mkdir(parents=True, exist_ok=True)
-            
-            processed_filename = f"{base_filename}_processed_{timestamp_str}.parquet"
-            processed_path = processed_dir / processed_filename
-            
-            # Save processed data as parquet for efficiency
-            df_processed.to_parquet(processed_path, index=False)
-            
-            saved_paths['processed'] = str(processed_path)
-            logger.info(f"Saved to processed: {processed_filename}")
-            
-            # Save metadata
-            metadata = {
-                'original_filename': file.filename,
-                'processed_filename': processed_filename,
-                'upload_timestamp': file_info['upload_timestamp'],
-                'original_rows': len(df),
-                'processed_rows': len(df_processed),
-                'columns': list(df_processed.columns),
-                'dtypes': {col: str(dtype) for col, dtype in df_processed.dtypes.items()},
-                'processing_summary': processing_summary,
-                'validation_results': validation_results
-            }
-            
-            metadata_path = processed_dir / f"{base_filename}_processed_{timestamp_str}_metadata.json"
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2, default=str)
-            
-            saved_paths['metadata'] = str(metadata_path)
+            try:
+                logger.info(f"[{upload_id}] Saving to processed directory...")
+                processed_dir = BASE_DIR / "data" / "processed"
+                processed_dir.mkdir(parents=True, exist_ok=True)
+                
+                processed_filename = f"{base_filename}_processed_{timestamp_str}.parquet"
+                processed_path = processed_dir / processed_filename
+                
+                # Save processed data as parquet for efficiency
+                df_processed.to_parquet(processed_path, index=False)
+                
+                saved_paths['processed'] = str(processed_path)
+                logger.info(f"[{upload_id}] ✓ Saved to processed: {processed_filename}")
+                
+                # Save metadata
+                metadata = {
+                    'original_filename': file.filename,
+                    'processed_filename': processed_filename,
+                    'upload_timestamp': file_info['upload_timestamp'],
+                    'original_rows': len(df),
+                    'processed_rows': len(df_processed),
+                    'columns': list(df_processed.columns),
+                    'dtypes': {col: str(dtype) for col, dtype in df_processed.dtypes.items()},
+                    'processing_summary': processing_summary,
+                    'validation_results': validation_results
+                }
+                
+                metadata_path = processed_dir / f"{base_filename}_processed_{timestamp_str}_metadata.json"
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2, default=str)
+                
+                saved_paths['metadata'] = str(metadata_path)
+                logger.info(f"[{upload_id}] ✓ Metadata saved")
+            except Exception as e:
+                logger.error(f"[{upload_id}] Failed to save processed data: {str(e)}", exc_info=True)
+                saved_paths['processed_error'] = str(e)
         
         # Calculate processing time
         processing_time = (datetime.now() - start_time).total_seconds()
@@ -722,6 +1350,7 @@ async def upload_data_file(
         response = {
             'status': 'success',
             'message': f"File '{file.filename}' uploaded successfully",
+            'upload_id': upload_id,
             'file_info': file_info,
             'validation_results': validation_results,
             'processing_summary': processing_summary if process_data else None,
@@ -730,28 +1359,48 @@ async def upload_data_file(
         }
         
         logger.info(
-            f"Upload completed: {file.filename} "
-            f"({processing_time:.2f}s, {len(saved_paths)} files saved)"
+            f"[{upload_id}] ✓ UPLOAD SUCCESSFUL | "
+            f"File: {file.filename} | "
+            f"Duration: {processing_time:.3f}s | "
+            f"Files saved: {len([k for k in saved_paths.keys() if not k.endswith('_error')])}"
         )
         
         return JSONResponse(content=response, status_code=200)
     
+    except APIError:
+        raise
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload failed: {str(e)}", exc_info=True)
-        raise HTTPException(
+        logger.error(f"[{upload_id}] Upload failed: {str(e)}", exc_info=True)
+        raise APIError(
+            message=f"Upload failed: {str(e)}",
             status_code=500,
-            detail=f"Upload failed: {str(e)}"
+            details={"upload_id": upload_id}
         )
 
 
 def _validate_uploaded_data(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Validate uploaded data for quality and completeness.
+    Validate uploaded data for quality and completeness with comprehensive logging.
     
     Returns validation results with warnings and errors.
+    
+    Args:
+        df: DataFrame to validate
+    
+    Returns:
+        Dictionary with validation results including:
+            - is_valid: Overall validation status
+            - has_warnings: Whether warnings exist
+            - has_errors: Whether errors exist
+            - warnings: List of warning messages
+            - errors: List of error messages
+            - stats: Validation statistics
     """
+    validation_id = f"val_{int(time.time() * 1000)}"
+    logger.debug(f"[{validation_id}] Starting data validation...")
+    
     validation = {
         'is_valid': True,
         'has_warnings': False,
@@ -761,72 +1410,108 @@ def _validate_uploaded_data(df: pd.DataFrame) -> Dict[str, Any]:
         'stats': {}
     }
     
-    # Check for empty DataFrame
-    if df.empty:
-        validation['errors'].append("DataFrame is empty")
+    try:
+        # Check for empty DataFrame
+        if df.empty:
+            validation['errors'].append("DataFrame is empty")
+            validation['has_errors'] = True
+            validation['is_valid'] = False
+            logger.error(f"[{validation_id}] ✗ Validation failed: Empty DataFrame")
+            return validation
+        
+        # Check for duplicate column names
+        duplicate_cols = df.columns[df.columns.duplicated()].tolist()
+        if duplicate_cols:
+            validation['errors'].append(f"Duplicate column names found: {duplicate_cols}")
+            validation['has_errors'] = True
+            validation['is_valid'] = False
+            logger.error(f"[{validation_id}] Duplicate columns: {duplicate_cols}")
+        
+        # Check for all-null columns
+        null_columns = df.columns[df.isnull().all()].tolist()
+        if null_columns:
+            validation['warnings'].append(
+                f"{len(null_columns)} columns contain only null values: {null_columns[:5]}"
+            )
+            validation['has_warnings'] = True
+            logger.warning(f"[{validation_id}] All-null columns: {len(null_columns)}")
+        
+        # Check null percentage
+        total_cells = df.shape[0] * df.shape[1]
+        null_cells = df.isnull().sum().sum()
+        null_percentage = (null_cells / total_cells) * 100 if total_cells > 0 else 0
+        
+        if null_percentage > 50:
+            validation['warnings'].append(
+                f"High percentage of null values: {null_percentage:.1f}%"
+            )
+            validation['has_warnings'] = True
+            logger.warning(f"[{validation_id}] High null percentage: {null_percentage:.1f}%")
+        
+        validation['stats']['null_percentage'] = round(null_percentage, 2)
+        
+        # Check for completely empty rows
+        empty_rows = df.isnull().all(axis=1).sum()
+        if empty_rows > 0:
+            validation['warnings'].append(f"{empty_rows} completely empty rows found")
+            validation['has_warnings'] = True
+            logger.warning(f"[{validation_id}] Empty rows: {empty_rows}")
+        
+        validation['stats']['empty_rows'] = int(empty_rows)
+        
+        # Data type distribution
+        dtype_counts = df.dtypes.value_counts().to_dict()
+        validation['stats']['data_types'] = {str(k): int(v) for k, v in dtype_counts.items()}
+        
+        # Memory usage
+        memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        validation['stats']['memory_usage_mb'] = round(memory_mb, 2)
+        
+        if memory_mb > 100:
+            validation['warnings'].append(
+                f"Large dataset: {memory_mb:.1f} MB in memory"
+            )
+            validation['has_warnings'] = True
+            logger.warning(f"[{validation_id}] Large dataset: {memory_mb:.1f} MB")
+        
+        status = "✓" if validation['is_valid'] else "✗"
+        logger.info(
+            f"[{validation_id}] {status} Validation complete | "
+            f"Errors: {len(validation['errors'])} | Warnings: {len(validation['warnings'])}"
+        )
+        
+        return validation
+        
+    except Exception as e:
+        logger.error(f"[{validation_id}] Validation error: {str(e)}", exc_info=True)
+        validation['errors'].append(f"Validation failed: {str(e)}")
         validation['has_errors'] = True
         validation['is_valid'] = False
         return validation
-    
-    # Check for duplicate column names
-    duplicate_cols = df.columns[df.columns.duplicated()].tolist()
-    if duplicate_cols:
-        validation['errors'].append(f"Duplicate column names found: {duplicate_cols}")
-        validation['has_errors'] = True
-        validation['is_valid'] = False
-    
-    # Check for all-null columns
-    null_columns = df.columns[df.isnull().all()].tolist()
-    if null_columns:
-        validation['warnings'].append(
-            f"{len(null_columns)} columns contain only null values: {null_columns[:5]}"
-        )
-        validation['has_warnings'] = True
-    
-    # Check null percentage
-    total_cells = df.shape[0] * df.shape[1]
-    null_cells = df.isnull().sum().sum()
-    null_percentage = (null_cells / total_cells) * 100
-    
-    if null_percentage > 50:
-        validation['warnings'].append(
-            f"High percentage of null values: {null_percentage:.1f}%"
-        )
-        validation['has_warnings'] = True
-    
-    validation['stats']['null_percentage'] = round(null_percentage, 2)
-    
-    # Check for completely empty rows
-    empty_rows = df.isnull().all(axis=1).sum()
-    if empty_rows > 0:
-        validation['warnings'].append(f"{empty_rows} completely empty rows found")
-        validation['has_warnings'] = True
-    
-    validation['stats']['empty_rows'] = int(empty_rows)
-    
-    # Data type distribution
-    dtype_counts = df.dtypes.value_counts().to_dict()
-    validation['stats']['data_types'] = {str(k): int(v) for k, v in dtype_counts.items()}
-    
-    # Memory usage
-    memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-    validation['stats']['memory_usage_mb'] = round(memory_mb, 2)
-    
-    if memory_mb > 100:
-        validation['warnings'].append(
-            f"Large dataset: {memory_mb:.1f} MB in memory"
-        )
-        validation['has_warnings'] = True
-    
-    return validation
 
 
 def _process_uploaded_data(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Apply basic data processing and cleaning to uploaded data.
+    Apply basic data processing and cleaning to uploaded data with comprehensive logging.
     
     Returns summary of processing actions taken.
+    
+    Args:
+        df: DataFrame to process (modified in-place)
+    
+    Returns:
+        Dictionary with processing summary including:
+            - actions: List of actions performed
+            - rows_before: Initial row count
+            - rows_after: Final row count
+            - columns_before: Initial column count
+            - columns_after: Final column count
+            - rows_removed: Number of rows removed
+            - columns_removed: Number of columns removed
     """
+    process_id = f"proc_{int(time.time() * 1000)}"
+    logger.debug(f"[{process_id}] Starting data processing...")
+    
     summary = {
         'actions': [],
         'rows_before': len(df),
@@ -835,46 +1520,63 @@ def _process_uploaded_data(df: pd.DataFrame) -> Dict[str, Any]:
         'columns_after': 0
     }
     
-    # Remove completely empty rows
-    initial_rows = len(df)
-    df.dropna(how='all', inplace=True)
-    removed_rows = initial_rows - len(df)
-    if removed_rows > 0:
-        summary['actions'].append(f"Removed {removed_rows} empty rows")
-    
-    # Remove completely empty columns
-    initial_cols = len(df.columns)
-    df.dropna(how='all', axis=1, inplace=True)
-    removed_cols = initial_cols - len(df.columns)
-    if removed_cols > 0:
-        summary['actions'].append(f"Removed {removed_cols} empty columns")
-    
-    # Standardize column names
-    original_columns = df.columns.tolist()
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(' ', '_')
-        .str.replace('[^a-z0-9_]', '', regex=True)
-    )
-    if list(df.columns) != original_columns:
-        summary['actions'].append("Standardized column names")
-    
-    # Remove leading/trailing whitespace from string columns
-    string_cols = df.select_dtypes(include=['object', 'string']).columns
-    for col in string_cols:
-        df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
-    if len(string_cols) > 0:
-        summary['actions'].append(f"Cleaned whitespace from {len(string_cols)} text columns")
-    
-    # Final stats
-    summary['rows_after'] = len(df)
-    summary['columns_after'] = len(df.columns)
-    summary['rows_removed'] = summary['rows_before'] - summary['rows_after']
-    summary['columns_removed'] = summary['columns_before'] - summary['columns_after']
-    
-    return summary
+    try:
+        # Remove completely empty rows
+        initial_rows = len(df)
+        df.dropna(how='all', inplace=True)
+        removed_rows = initial_rows - len(df)
+        if removed_rows > 0:
+            summary['actions'].append(f"Removed {removed_rows} empty rows")
+            logger.info(f"[{process_id}] Removed {removed_rows} empty rows")
+        
+        # Remove completely empty columns
+        initial_cols = len(df.columns)
+        df.dropna(how='all', axis=1, inplace=True)
+        removed_cols = initial_cols - len(df.columns)
+        if removed_cols > 0:
+            summary['actions'].append(f"Removed {removed_cols} empty columns")
+            logger.info(f"[{process_id}] Removed {removed_cols} empty columns")
+        
+        # Standardize column names
+        original_columns = df.columns.tolist()
+        df.columns = (
+            df.columns
+            .str.strip()
+            .str.lower()
+            .str.replace(' ', '_')
+            .str.replace('[^a-z0-9_]', '', regex=True)
+        )
+        if list(df.columns) != original_columns:
+            summary['actions'].append("Standardized column names")
+            logger.info(f"[{process_id}] Standardized column names")
+        
+        # Remove leading/trailing whitespace from string columns
+        string_cols = df.select_dtypes(include=['object', 'string']).columns
+        for col in string_cols:
+            df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+        if len(string_cols) > 0:
+            summary['actions'].append(f"Cleaned whitespace from {len(string_cols)} text columns")
+            logger.info(f"[{process_id}] Cleaned {len(string_cols)} text columns")
+        
+        # Final stats
+        summary['rows_after'] = len(df)
+        summary['columns_after'] = len(df.columns)
+        summary['rows_removed'] = summary['rows_before'] - summary['rows_after']
+        summary['columns_removed'] = summary['columns_before'] - summary['columns_after']
+        
+        logger.info(
+            f"[{process_id}] ✓ Processing complete | "
+            f"Actions: {len(summary['actions'])} | "
+            f"Rows: {summary['rows_before']} → {summary['rows_after']} | "
+            f"Columns: {summary['columns_before']} → {summary['columns_after']}"
+        )
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"[{process_id}] Processing error: {str(e)}", exc_info=True)
+        summary['error'] = str(e)
+        return summary
 
 
 @router.get("/anomalies/detect")
