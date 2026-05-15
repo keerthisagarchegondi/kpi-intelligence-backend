@@ -72,6 +72,31 @@ services:
       - kpi-network
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
 
+  # Integration Test Service (optional - for running tests in container)
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kpi-intelligence-tests
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Test environment configuration
+      ENVIRONMENT: test
+      DEBUG: "true"
+      DATABASE_URL: postgresql://${DB_USER:-kpiuser}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-kpi_intelligence}
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+    volumes:
+      - .:/app
+      - ./test_reports:/app/test_reports
+    networks:
+      - kpi-network
+    command: python run_integration_tests.py
+    profiles:
+      - test
+
 # Volumes for data persistence
 volumes:
   postgres_data:

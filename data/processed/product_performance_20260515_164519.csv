@@ -1,0 +1,11 @@
+product,total_revenue,avg_revenue,transaction_count,total_quantity,avg_quantity,total_cost,return_count,total_profit,profit_margin,roi,return_rate,avg_price,market_share,category,revenue_rank,quantity_rank,profit_rank
+Laptop Pro,127351.4,1369.37,93,107,1.15,98581.2,8,28770.19,22.59,29.18,8.6,1190.2,29.49,Computers,1,1,1
+Phone Elite,94252.81,981.8,96,106,1.1,73054.69,3,21198.12,22.49,29.02,3.12,889.18,21.83,Phones,2,2,2
+Tablet Max,68101.32,896.07,76,85,1.12,52452.31,5,15649.01,22.98,29.83,6.58,801.19,15.77,Computers,3,6,3
+Monitor 4K,47702.32,574.73,83,94,1.13,37103.96,2,10598.36,22.22,28.56,2.41,507.47,11.05,Accessories,4,5,4
+Watch Smart,41187.0,424.61,97,102,1.05,31977.31,6,9209.69,22.36,28.8,6.19,403.79,9.54,Wearables,5,3,5
+Speaker Bluetooth,18774.52,218.31,86,94,1.09,14516.42,3,4258.1,22.68,29.33,3.49,199.73,4.35,Audio,6,5,6
+Earbuds Wireless,14339.42,181.51,79,94,1.19,11030.7,9,3308.73,23.07,30.0,11.39,152.55,3.32,Audio,7,5,7
+Keyboard Mech,9565.28,140.67,68,79,1.16,7505.06,3,2060.22,21.54,27.45,4.41,121.08,2.22,Accessories,8,8,8
+Mouse Gaming,8049.15,90.44,89,100,1.12,6240.47,8,1808.68,22.47,28.98,8.99,80.49,1.86,Accessories,9,4,9
+Charger Fast,2514.42,35.41,71,84,1.18,1943.52,0,570.91,22.71,29.37,0.0,29.93,0.58,Accessories,10,7,10

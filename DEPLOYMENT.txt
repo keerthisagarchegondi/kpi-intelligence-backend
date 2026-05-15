@@ -1,0 +1,105 @@
+# Production Deployment Guide
+
+## Quick Start
+
+### Using PowerShell (Windows)
+
+```powershell
+# Deploy production environment
+.\manage.ps1 production-deploy
+
+# Run integration tests
+.\manage.ps1 test-local
+
+# Check health status
+.\manage.ps1 health-check
+```
+
+### Using Make (Linux/Mac)
+
+```bash
+# Deploy production environment
+make production-deploy
+
+# Run integration tests
+make test-local
+
+# Check health status
+make health-check
+```
+
+## Docker Commands
+
+### Start Services
+```bash
+docker-compose up -d
+```
+
+### Stop Services
+```bash
+docker-compose down
+```
+
+### View Logs
+```bash
+docker-compose logs -f
+```
+
+### Run Tests in Docker
+```bash
+docker-compose --profile test up test
+```
+
+## Environment Configuration
+
+The `.env` file contains all production settings:
+- Database credentials
+- API configuration
+- CORS settings
+- Logging levels
+
+## Health Checks
+
+API Health: http://localhost:8000/health
+API Docs: http://localhost:8000/docs
+
+## Test Reports
+
+Integration test reports are saved to: `test_reports/`
+
+## Production Checklist
+
+- [x] Docker Compose configured
+- [x] Production Dockerfile with multi-stage build
+- [x] Environment variables configured
+- [x] Integration tests passing (98/98)
+- [x] Health checks enabled
+- [x] Logging configured
+- [x] Volume persistence for data
+- [x] Non-root user in container
+- [x] Security best practices applied
+
+## Architecture
+
+```
+┌─────────────────┐
+│   API Service   │
+│   (Port 8000)   │
+│   FastAPI       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   PostgreSQL    │
+│   (Port 5432)   │
+│   Database      │
+└─────────────────┘
+```
+
+## Testing Results
+
+Total Tests: 98
+- test_ingestion.py: 48 tests ✓
+- test_kpi_calculations.py: 50 tests ✓
+
+All tests passed successfully!
