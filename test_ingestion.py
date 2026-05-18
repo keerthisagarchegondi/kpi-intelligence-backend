@@ -36,8 +36,6 @@ sys.path.insert(0, 'scripts')
 from ingest import (
     load_raw_data,
     save_to_database,
-    get_data_profile,
-    read_csv_data,
     save_file_to_raw,
     DataIngestionError,
     FileFormatNotSupportedError,
@@ -49,6 +47,9 @@ from ingest import (
     _clean_dataframe,
     _validate_dataframe
 )
+
+# Note: read_csv_data and get_data_profile have been removed from ingest.py
+# as they are not used in the production API. Tests for these functions have been disabled.
 
 
 class TestDataIngestion(unittest.TestCase):
